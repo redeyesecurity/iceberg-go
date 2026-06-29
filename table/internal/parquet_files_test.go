@@ -743,6 +743,29 @@ func TestGetWritePropertiesBloomFilter(t *testing.T) {
 	})
 }
 
+// REDEYE PATCH test: write.parquet.dictionary-enabled controls Parquet dictionary
+// encoding. Default (absent property) stays OFF to match upstream; "true" turns it ON.
+func TestGetWritePropertiesDictionary(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	t.Run("dictionary disabled by default (upstream behavior)", func(t *testing.T) {
+		wp := parquet.NewWriterProperties(format.GetWriteProperties(iceberg.Properties{}).([]parquet.WriterProperty)...)
+		assert.False(t, wp.DictionaryEnabled(), "absent property must keep dictionary OFF (upstream default)")
+	})
+
+	t.Run("dictionary enabled when property is true", func(t *testing.T) {
+		props := iceberg.Properties{internal.ParquetDictEnabledKey: "true"}
+		wp := parquet.NewWriterProperties(format.GetWriteProperties(props).([]parquet.WriterProperty)...)
+		assert.True(t, wp.DictionaryEnabled(), "write.parquet.dictionary-enabled=true must turn dictionary ON")
+	})
+
+	t.Run("dictionary disabled when property is false", func(t *testing.T) {
+		props := iceberg.Properties{internal.ParquetDictEnabledKey: "false"}
+		wp := parquet.NewWriterProperties(format.GetWriteProperties(props).([]parquet.WriterProperty)...)
+		assert.False(t, wp.DictionaryEnabled(), "write.parquet.dictionary-enabled=false must keep dictionary OFF")
+	})
+}
+
 func TestParquetBatchSizeFromTableProperties(t *testing.T) {
 	t.Run("default batch size when no properties in context", func(t *testing.T) {
 		ctx := context.Background()

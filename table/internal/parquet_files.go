@@ -66,6 +66,14 @@ const (
 	ParquetBloomFilterMaxBytesDefault        = 1024 * 1024
 	ParquetBloomFilterColumnEnabledKeyPrefix = "write.parquet.bloom-filter-enabled.column"
 
+	// REDEYE PATCH (write.parquet.dictionary-enabled): table property that toggles
+	// Parquet dictionary encoding. Upstream v0.6.0 hardcodes dictionary OFF in
+	// GetWriteProperties (WithDictionaryDefault(false)) with no config hook. This key
+	// lets a table opt in. Default stays false to match upstream behavior, so the
+	// patch is a pure superset and is upstreamable as-is. See PATCH.md.
+	ParquetDictEnabledKey     = "write.parquet.dictionary-enabled"
+	ParquetDictEnabledDefault = false
+
 	ParquetBatchSizeKey     = "read.parquet.batch-size"
 	ParquetBatchSizeDefault = 1 << 17 // 131072 rows
 )
@@ -242,7 +250,11 @@ func (parquetFormat) GetWriteProperties(props iceberg.Properties) any {
 	}
 
 	writerProps := []parquet.WriterProperty{
-		parquet.WithDictionaryDefault(false),
+		// REDEYE PATCH: honor the write.parquet.dictionary-enabled table property
+		// (default false = upstream behavior). When "true", enable dictionary
+		// encoding globally; parquet auto-falls-back to PLAIN per column-chunk when a
+		// dictionary would exceed WithDictionaryPageSizeLimit, so enabling is safe.
+		parquet.WithDictionaryDefault(props.GetBool(ParquetDictEnabledKey, ParquetDictEnabledDefault)),
 		parquet.WithMaxRowGroupLength(int64(props.GetInt(ParquetRowGroupLimitKey,
 			ParquetRowGroupLimitDefault))),
 		parquet.WithDataPageSize(int64(props.GetInt(ParquetPageSizeBytesKey,
