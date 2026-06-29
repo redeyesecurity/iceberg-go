@@ -74,6 +74,16 @@ const (
 	ParquetDictEnabledKey     = "write.parquet.dictionary-enabled"
 	ParquetDictEnabledDefault = false
 
+	// REDEYE PATCH (per-column dictionary): write.parquet.dictionary-enabled.column.<col-name>
+	// toggles Parquet dictionary encoding for an individual column, mirroring the existing
+	// write.parquet.bloom-filter-enabled.column.<col-name> per-column prefix. A per-column
+	// key takes precedence over the global write.parquet.dictionary-enabled default for the
+	// named column (parquet resolves per-column overrides over the global default). This
+	// lets a table enable dictionary ONLY on its low-cardinality columns (e.g.
+	// index/host/source/sourcetype) and leave high-cardinality columns (e.g. _time/_raw)
+	// PLAIN, so dictionary encoding never bloats a high-cardinality column. See PATCH.md.
+	ParquetDictEnabledColumnKeyPrefix = "write.parquet.dictionary-enabled.column"
+
 	ParquetBatchSizeKey     = "read.parquet.batch-size"
 	ParquetBatchSizeDefault = 1 << 17 // 131072 rows
 )
@@ -313,6 +323,24 @@ func (parquetFormat) GetWriteProperties(props iceberg.Properties) any {
 		// "yes", is false. strconv.ParseBool behaves differently ("1" → true).
 		enabled := strings.EqualFold(val, "true")
 		writerProps = append(writerProps, parquet.WithBloomFilterEnabledFor(colName, enabled))
+	}
+
+	// REDEYE PATCH: write.parquet.dictionary-enabled.column.<col-name> toggles dictionary
+	// encoding for individual columns, mirroring the bloom-filter per-column prefix above.
+	// These per-column settings override the global write.parquet.dictionary-enabled
+	// default for the named column, so a table can enable dictionary on its low-cardinality
+	// columns only and leave high-cardinality columns (e.g. _time/_raw) PLAIN. Scan all
+	// properties for the prefix. The global key (exact match, read above) is unaffected
+	// because its value lookup is exact, not prefix-based.
+	dictPrefix := ParquetDictEnabledColumnKeyPrefix + "."
+	for key, val := range props {
+		colName, ok := strings.CutPrefix(key, dictPrefix)
+		if !ok || colName == "" {
+			continue
+		}
+		// EqualFold matches Java's Boolean.parseBoolean (same semantics as the bloom path).
+		enabled := strings.EqualFold(val, "true")
+		writerProps = append(writerProps, parquet.WithDictionaryFor(colName, enabled))
 	}
 
 	return writerProps

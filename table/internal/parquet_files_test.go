@@ -764,6 +764,106 @@ func TestGetWritePropertiesDictionary(t *testing.T) {
 		wp := parquet.NewWriterProperties(format.GetWriteProperties(props).([]parquet.WriterProperty)...)
 		assert.False(t, wp.DictionaryEnabled(), "write.parquet.dictionary-enabled=false must keep dictionary OFF")
 	})
+
+	// REDEYE PATCH (per-column): write.parquet.dictionary-enabled.column.<col> resolves
+	// per-column, mirroring the bloom-filter per-column prefix, and takes precedence over
+	// the global default for the named column. This is the property-resolution level.
+	t.Run("per-column dictionary resolves per column", func(t *testing.T) {
+		props := iceberg.Properties{
+			internal.ParquetDictEnabledColumnKeyPrefix + ".index":      "true",
+			internal.ParquetDictEnabledColumnKeyPrefix + ".host":       "true",
+			internal.ParquetDictEnabledColumnKeyPrefix + ".source":     "true",
+			internal.ParquetDictEnabledColumnKeyPrefix + ".sourcetype": "true",
+		}
+		wp := parquet.NewWriterProperties(format.GetWriteProperties(props).([]parquet.WriterProperty)...)
+		assert.False(t, wp.DictionaryEnabled(), "global default must stay OFF when only per-column keys are set")
+		assert.True(t, wp.DictionaryEnabledFor("index"), "index must be dictionary-enabled")
+		assert.True(t, wp.DictionaryEnabledFor("host"), "host must be dictionary-enabled")
+		assert.True(t, wp.DictionaryEnabledFor("source"), "source must be dictionary-enabled")
+		assert.True(t, wp.DictionaryEnabledFor("sourcetype"), "sourcetype must be dictionary-enabled")
+		assert.False(t, wp.DictionaryEnabledFor("_time"), "unlisted _time must stay PLAIN (global default)")
+		assert.False(t, wp.DictionaryEnabledFor("_raw"), "unlisted _raw must stay PLAIN (global default)")
+	})
+
+	t.Run("per-column key overrides true global default to false", func(t *testing.T) {
+		props := iceberg.Properties{
+			internal.ParquetDictEnabledKey:                       "true",
+			internal.ParquetDictEnabledColumnKeyPrefix + "._raw": "false",
+		}
+		wp := parquet.NewWriterProperties(format.GetWriteProperties(props).([]parquet.WriterProperty)...)
+		assert.True(t, wp.DictionaryEnabled(), "global default ON")
+		assert.True(t, wp.DictionaryEnabledFor("index"), "unlisted column follows ON global default")
+		assert.False(t, wp.DictionaryEnabledFor("_raw"), "per-column false must override the ON global default")
+	})
+
+	// Encoding-level proof: a per-column dict prop must make that column come out
+	// RLE_DICTIONARY in the actual parquet, while an unlisted column stays PLAIN.
+	t.Run("per-column dictionary yields RLE_DICTIONARY for named column, PLAIN for unlisted", func(t *testing.T) {
+		props := iceberg.Properties{
+			internal.ParquetDictEnabledColumnKeyPrefix + ".index": "true",
+			// "_raw" intentionally unlisted -> must stay PLAIN.
+		}
+		writeProps := format.GetWriteProperties(props).([]parquet.WriterProperty)
+
+		root, err := schema.NewGroupNode("schema", parquet.Repetitions.Required, schema.FieldList{
+			schema.NewByteArrayNode("index", parquet.Repetitions.Required, -1),
+			schema.NewByteArrayNode("_raw", parquet.Repetitions.Required, -1),
+		}, -1)
+		require.NoError(t, err)
+
+		var buf bytes.Buffer
+		pw := file.NewParquetWriter(&buf, root, file.WithWriterProps(
+			parquet.NewWriterProperties(writeProps...),
+		))
+		rgw := pw.AppendRowGroup()
+
+		// index: highly repeated low-cardinality value (dictionary should kick in).
+		idxVals := make([]parquet.ByteArray, 200)
+		for i := range idxVals {
+			idxVals[i] = parquet.ByteArray("main")
+		}
+		cwIdx, _ := rgw.NextColumn()
+		_, err = cwIdx.(*file.ByteArrayColumnChunkWriter).WriteBatch(idxVals, nil, nil)
+		require.NoError(t, err)
+		require.NoError(t, cwIdx.Close())
+
+		// _raw: also repeated, but unlisted -> must stay PLAIN despite low cardinality.
+		rawVals := make([]parquet.ByteArray, 200)
+		for i := range rawVals {
+			rawVals[i] = parquet.ByteArray("raw-line")
+		}
+		cwRaw, _ := rgw.NextColumn()
+		_, err = cwRaw.(*file.ByteArrayColumnChunkWriter).WriteBatch(rawVals, nil, nil)
+		require.NoError(t, err)
+		require.NoError(t, cwRaw.Close())
+
+		require.NoError(t, rgw.Close())
+		require.NoError(t, pw.Close())
+
+		rdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+		require.NoError(t, err)
+		defer rdr.Close()
+
+		hasDict := func(encs []parquet.Encoding) bool {
+			for _, e := range encs {
+				if e == parquet.Encodings.RLEDict || e == parquet.Encodings.PlainDict {
+					return true
+				}
+			}
+			return false
+		}
+
+		rg := rdr.MetaData().RowGroup(0)
+		idxChunk, err := rg.ColumnChunk(0)
+		require.NoError(t, err)
+		rawChunk, err := rg.ColumnChunk(1)
+		require.NoError(t, err)
+
+		assert.True(t, hasDict(idxChunk.Encodings()),
+			"index (per-column dict enabled) must be dictionary-encoded, got %v", idxChunk.Encodings())
+		assert.False(t, hasDict(rawChunk.Encodings()),
+			"_raw (unlisted) must stay PLAIN, got %v", rawChunk.Encodings())
+	})
 }
 
 func TestParquetBatchSizeFromTableProperties(t *testing.T) {
