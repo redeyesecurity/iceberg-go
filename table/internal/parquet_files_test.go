@@ -866,6 +866,176 @@ func TestGetWritePropertiesDictionary(t *testing.T) {
 	})
 }
 
+// REDEYE PATCH test: write.parquet.encoding.column.<col-name>.
+//
+// The assertion that matters is the last one, and it is on the WRITTEN FILE rather than on
+// the property list: a property that is accepted and then does not change the bytes is the
+// failure this patch exists to avoid. caver-go #3032 was about to add an encoding table
+// property to a writer that had no encoding hook at all, redeploy, measure no change, and
+// conclude delta encoding does not help.
+func TestGetWritePropertiesEncodingColumn(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	t.Run("known names map, unknown names are ignored not fatal", func(t *testing.T) {
+		for _, name := range []string{"DELTA_BINARY_PACKED", "delta_binary_packed", " Delta_Binary_Packed "} {
+			props := iceberg.Properties{internal.ParquetEncodingColumnKeyPrefix + "._time": name}
+			assert.NotPanics(t, func() { format.GetWriteProperties(props) }, "name %q", name)
+		}
+		// An operator typo must not take the writer down; the column keeps its default.
+		props := iceberg.Properties{internal.ParquetEncodingColumnKeyPrefix + "._time": "DLETA_BINARY_PACKED"}
+		assert.NotPanics(t, func() { format.GetWriteProperties(props) })
+	})
+
+	t.Run("an int64 column comes out DELTA_BINARY_PACKED, an unlisted one stays PLAIN", func(t *testing.T) {
+		props := iceberg.Properties{
+			internal.ParquetEncodingColumnKeyPrefix + "._time": "DELTA_BINARY_PACKED",
+			// "other" intentionally unlisted -> must stay PLAIN.
+		}
+		writeProps := format.GetWriteProperties(props).([]parquet.WriterProperty)
+
+		root, err := schema.NewGroupNode("schema", parquet.Repetitions.Required, schema.FieldList{
+			schema.NewInt64Node("_time", parquet.Repetitions.Required, -1),
+			schema.NewInt64Node("other", parquet.Repetitions.Required, -1),
+		}, -1)
+		require.NoError(t, err)
+
+		var buf bytes.Buffer
+		pw := file.NewParquetWriter(&buf, root, file.WithWriterProps(
+			parquet.NewWriterProperties(writeProps...),
+		))
+		rgw := pw.AppendRowGroup()
+
+		// Microsecond timestamps a millisecond apart: what the lake actually writes.
+		vals := make([]int64, 500)
+		for i := range vals {
+			vals[i] = int64(1_756_000_000_000_000 + i*1000)
+		}
+		cwTime, _ := rgw.NextColumn()
+		_, err = cwTime.(*file.Int64ColumnChunkWriter).WriteBatch(vals, nil, nil)
+		require.NoError(t, err)
+		require.NoError(t, cwTime.Close())
+
+		cwOther, _ := rgw.NextColumn()
+		_, err = cwOther.(*file.Int64ColumnChunkWriter).WriteBatch(vals, nil, nil)
+		require.NoError(t, err)
+		require.NoError(t, cwOther.Close())
+
+		require.NoError(t, rgw.Close())
+		require.NoError(t, pw.Close())
+
+		rdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+		require.NoError(t, err)
+		defer rdr.Close()
+
+		has := func(encs []parquet.Encoding, want parquet.Encoding) bool {
+			for _, e := range encs {
+				if e == want {
+					return true
+				}
+			}
+			return false
+		}
+
+		rg := rdr.MetaData().RowGroup(0)
+		timeChunk, err := rg.ColumnChunk(0)
+		require.NoError(t, err)
+		otherChunk, err := rg.ColumnChunk(1)
+		require.NoError(t, err)
+
+		assert.True(t, has(timeChunk.Encodings(), parquet.Encodings.DeltaBinaryPacked),
+			"_time (per-column encoding set) must be DELTA_BINARY_PACKED, got %v", timeChunk.Encodings())
+		assert.False(t, has(otherChunk.Encodings(), parquet.Encodings.DeltaBinaryPacked),
+			"other (unlisted) must not be delta-encoded, got %v", otherChunk.Encodings())
+
+		// The point of the whole exercise: delta must actually be SMALLER on this data.
+		// Without this, the patch could ship an encoding that is accepted, applied, and a
+		// pessimisation.
+		t.Logf("MEASURED: delta _time=%d bytes, PLAIN other=%d bytes (%.1fx smaller)",
+			timeChunk.TotalCompressedSize(), otherChunk.TotalCompressedSize(),
+			float64(otherChunk.TotalCompressedSize())/float64(timeChunk.TotalCompressedSize()))
+		assert.Less(t, timeChunk.TotalCompressedSize(), otherChunk.TotalCompressedSize(),
+			"delta-encoded _time (%d bytes) must be smaller than the PLAIN column (%d bytes)",
+			timeChunk.TotalCompressedSize(), otherChunk.TotalCompressedSize())
+	})
+}
+
+// The honest number for the data caver-go actually writes.
+//
+// The test above uses perfectly ordered timestamps and gets ~10x, which is the BEST case
+// and not our case: the lake sorts on the host dimension (CAVER_LAKE_COMPACT_SORT=1), so
+// _time arrives at the encoder interleaved across hosts. caver-go #3032 is about exactly
+// that. Quoting the ordered number as the expected win would be the same error as quoting
+// a 15% estate saving from an unmeasured premise, which is what #3032's own author had to
+// withdraw.
+//
+// So this measures the interleaved shape and asserts only what it can: delta must still be
+// a WIN, not a pessimisation. Whatever the ratio turns out to be is logged rather than
+// asserted, because the number belongs to the data, not to the patch.
+func TestEncodingColumnOnInterleavedTimestamps(t *testing.T) {
+	format := internal.GetFileFormat(iceberg.ParquetFile)
+
+	write := func(t *testing.T, encoded bool, vals []int64) int64 {
+		t.Helper()
+		// zstd on both sides, stated explicitly rather than relied on: it is already
+		// ParquetCompressionDefault, so setting it changes nothing here and is written down
+		// only so a reader knows what the ratio below MEANS. It is what delta adds ON TOP
+		// of the codec, not delta versus raw PLAIN. Getting that wrong would report a
+		// number the estate can never reach.
+		props := iceberg.Properties{internal.ParquetCompressionKey: "zstd"}
+		if encoded {
+			props[internal.ParquetEncodingColumnKeyPrefix+"._time"] = "DELTA_BINARY_PACKED"
+		}
+		writeProps := format.GetWriteProperties(props).([]parquet.WriterProperty)
+		root, err := schema.NewGroupNode("schema", parquet.Repetitions.Required, schema.FieldList{
+			schema.NewInt64Node("_time", parquet.Repetitions.Required, -1),
+		}, -1)
+		require.NoError(t, err)
+		var buf bytes.Buffer
+		pw := file.NewParquetWriter(&buf, root, file.WithWriterProps(parquet.NewWriterProperties(writeProps...)))
+		rgw := pw.AppendRowGroup()
+		cw, _ := rgw.NextColumn()
+		_, err = cw.(*file.Int64ColumnChunkWriter).WriteBatch(vals, nil, nil)
+		require.NoError(t, err)
+		require.NoError(t, cw.Close())
+		require.NoError(t, rgw.Close())
+		require.NoError(t, pw.Close())
+		rdr, err := file.NewParquetReader(bytes.NewReader(buf.Bytes()))
+		require.NoError(t, err)
+		defer rdr.Close()
+		ch, err := rdr.MetaData().RowGroup(0).ColumnChunk(0)
+		require.NoError(t, err)
+		return ch.TotalCompressedSize()
+	}
+
+	// 40 hosts, each with its own contiguous run, which is what a host-sorted file looks
+	// like: monotonic WITHIN a run, jumping backwards at every run boundary.
+	const hosts, perHost = 40, 50
+	interleaved := make([]int64, 0, hosts*perHost)
+	base := int64(1_756_000_000_000_000)
+	for h := 0; h < hosts; h++ {
+		for i := 0; i < perHost; i++ {
+			interleaved = append(interleaved, base+int64(i)*1000+int64(h)*7)
+		}
+	}
+
+	plain := write(t, false, interleaved)
+	delta := write(t, true, interleaved)
+
+	// The same measurement on a perfectly ORDERED column, so the gap between the two is
+	// visible rather than assumed. This is the sort question #3032 step 2 is about.
+	ordered := make([]int64, len(interleaved))
+	for i := range ordered {
+		ordered[i] = base + int64(i)*1000
+	}
+	op, od := write(t, false, ordered), write(t, true, ordered)
+	t.Logf("MEASURED (perfectly ordered + zstd): PLAIN=%d delta=%d (%.2fx)", op, od, float64(op)/float64(od))
+	t.Logf("MEASURED (host-sorted shape, zstd both sides, %d hosts x %d events): PLAIN=%d delta=%d (%.2fx)",
+		hosts, perHost, plain, delta, float64(plain)/float64(delta))
+
+	assert.Less(t, delta, plain,
+		"delta must not be a PESSIMISATION on the interleaved shape the lake actually writes (plain=%d delta=%d)", plain, delta)
+}
+
 func TestParquetBatchSizeFromTableProperties(t *testing.T) {
 	t.Run("default batch size when no properties in context", func(t *testing.T) {
 		ctx := context.Background()

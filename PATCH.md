@@ -137,3 +137,44 @@ Then bump the `replace` line in caver-go's go.mod to the new tag/sha and `go mod
 
 If upstream adds a native `write.parquet.dictionary-enabled` (or equivalent) property,
 drop the fork entirely and delete the `replace` line.
+
+## 3. Per-column encoding: `write.parquet.encoding.column.<col-name>`
+
+Upstream exposes no encoding property at all. A table that wants
+`DELTA_BINARY_PACKED` on a timestamp column has no way to ask for it, which is
+how caver-go#3032 nearly shipped an encoding table property against a writer
+with no encoding hook: the key would have been accepted, changed nothing, and
+taught everyone that delta encoding does not help.
+
+`GetWriteProperties` now scans for the `write.parquet.encoding.column.` prefix
+and emits `parquet.WithEncodingFor(col, enc)`. Accepted values are the Parquet
+encoding names as the format spells them, case-insensitive: `PLAIN`,
+`DELTA_BINARY_PACKED`, `DELTA_BYTE_ARRAY`, `DELTA_LENGTH_BYTE_ARRAY`,
+`BYTE_STREAM_SPLIT`. `RLE_DICTIONARY` / `PLAIN_DICTIONARY` are deliberately NOT
+accepted here: dictionary is reachable through the dictionary property, and two
+ways to say one thing is how they drift apart.
+
+An unrecognised value is IGNORED, not fatal. A table property is
+operator-supplied config and a typo must not take the writer down; the column
+keeps its default encoding.
+
+Dictionary wins when both apply, which is parquet's own resolution order, so
+this is safe to set unconditionally: a dictionary column keeps
+`RLE_DICTIONARY`, and only a column left non-dictionary takes the requested
+encoding. That is precisely the `_time` / `_raw` case the per-column dictionary
+patch above created.
+
+### Measured
+
+Both sides zstd (the default), so these are what delta adds ON TOP of the codec,
+not delta versus raw PLAIN:
+
+| `_time` column shape | PLAIN | delta | ratio |
+|---|---|---|---|
+| perfectly ordered | 3882 B | 111 B | 35.0x |
+| host-sorted (40 hosts interleaved) | 2385 B | 268 B | 8.9x |
+
+The second row is the shape caver-go actually writes, since its lake sorts on
+the host dimension. Both are a synthetic corpus: they establish that the knob
+works and that delta is not a pessimisation on interleaved data. What it is
+worth on the estate has to be measured on real files after it is deployed.

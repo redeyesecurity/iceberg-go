@@ -84,6 +84,26 @@ const (
 	// PLAIN, so dictionary encoding never bloats a high-cardinality column. See PATCH.md.
 	ParquetDictEnabledColumnKeyPrefix = "write.parquet.dictionary-enabled.column"
 
+	// REDEYE PATCH (per-column encoding): write.parquet.encoding.column.<col-name> selects
+	// the Parquet ENCODING for an individual column, the third per-column knob beside the
+	// dictionary and bloom-filter prefixes above. Upstream exposes no encoding property at
+	// all, so a table that wants DELTA_BINARY_PACKED on a timestamp column has no way to
+	// ask for it.
+	//
+	// Motivation (caver-go #3032): _time is deliberately left PLAIN because a dictionary on
+	// a high-cardinality timestamp is near-useless and measured ~77% LARGER. But PLAIN is
+	// not the only non-dictionary option. A microsecond timestamp column delta-encodes well
+	// even when it is not perfectly ordered, and on the caver estate _time is ~19% of bytes
+	// compressing at only ~4:1 while _raw manages ~55:1. Dictionary and encoding are
+	// separate decisions and this makes them separately expressible.
+	//
+	// Values are the Parquet encoding names as the format spells them, case-insensitive:
+	// PLAIN, DELTA_BINARY_PACKED, DELTA_BYTE_ARRAY, DELTA_LENGTH_BYTE_ARRAY,
+	// BYTE_STREAM_SPLIT. An unrecognized value is IGNORED rather than fatal: a table
+	// property is operator-supplied config, and a typo must not take the writer down. See
+	// PATCH.md.
+	ParquetEncodingColumnKeyPrefix = "write.parquet.encoding.column"
+
 	ParquetBatchSizeKey     = "read.parquet.batch-size"
 	ParquetBatchSizeDefault = 1 << 17 // 131072 rows
 )
@@ -343,7 +363,53 @@ func (parquetFormat) GetWriteProperties(props iceberg.Properties) any {
 		writerProps = append(writerProps, parquet.WithDictionaryFor(colName, enabled))
 	}
 
+	// REDEYE PATCH: write.parquet.encoding.column.<col-name> selects the encoding for an
+	// individual column. Same scan shape as the dictionary prefix above.
+	//
+	// Ordering note: parquet resolves the per-column encoding against the per-column
+	// dictionary setting, and dictionary WINS when it is on. That is why this is safe to
+	// apply unconditionally here - a column with dictionary enabled keeps RLE_DICTIONARY,
+	// and only a column left non-dictionary (which is the case this exists for) takes the
+	// requested encoding.
+	encPrefix := ParquetEncodingColumnKeyPrefix + "."
+	for key, val := range props {
+		colName, ok := strings.CutPrefix(key, encPrefix)
+		if !ok || colName == "" {
+			continue
+		}
+		enc, ok := parquetEncodingByName(val)
+		if !ok {
+			// Ignored, not fatal. An operator typo in a table property should not stop the
+			// writer; the column simply keeps its default encoding.
+			continue
+		}
+		writerProps = append(writerProps, parquet.WithEncodingFor(colName, enc))
+	}
+
 	return writerProps
+}
+
+// parquetEncodingByName maps a Parquet encoding NAME, as the format spells it, to the
+// arrow-go constant. Case-insensitive, and unknown names report false so the caller can
+// ignore them rather than guess.
+//
+// Deliberately a small allow-list rather than every constant arrow-go defines. RLE and
+// PLAIN_DICTIONARY are reachable through the dictionary property and do not belong here;
+// the rest are either read-only legacy or not selectable per column.
+func parquetEncodingByName(name string) (parquet.Encoding, bool) {
+	switch strings.ToUpper(strings.TrimSpace(name)) {
+	case "PLAIN":
+		return parquet.Encodings.Plain, true
+	case "DELTA_BINARY_PACKED":
+		return parquet.Encodings.DeltaBinaryPacked, true
+	case "DELTA_BYTE_ARRAY":
+		return parquet.Encodings.DeltaByteArray, true
+	case "DELTA_LENGTH_BYTE_ARRAY":
+		return parquet.Encodings.DeltaLengthByteArray, true
+	case "BYTE_STREAM_SPLIT":
+		return parquet.Encodings.ByteStreamSplit, true
+	}
+	return parquet.Encoding(0), false
 }
 
 func (p parquetFormat) WriteDataFile(ctx context.Context, fs iceio.WriteFileIO, partitionValues map[int]any, info WriteFileInfo, batches []arrow.RecordBatch) (iceberg.DataFile, error) {
