@@ -62,16 +62,20 @@ func PathBaseOf(fsys any) string {
 }
 
 // IsRelativePath reports whether p is a relative path: no scheme and no leading
-// slash. "file:///w/x", "s3://b/x" and "/w/x" are absolute.
+// slash. "file:///w/x", "file:/w/x" (path.Clean's spelling), "s3://b/x", "C:/x" and
+// "/w/x" are absolute.
 func IsRelativePath(p string) bool {
-	if p == "" {
+	if p == "" || strings.HasPrefix(p, "/") {
 		return false
 	}
-	if strings.Contains(p, "://") {
-		return false
+	// A scheme (or a Windows drive letter) is anything before the first slash that
+	// ends in a colon: "s3:", "file:", "C:".
+	head := p
+	if i := strings.IndexByte(p, '/'); i >= 0 {
+		head = p[:i]
 	}
 
-	return !strings.HasPrefix(p, "/")
+	return !strings.HasSuffix(head, ":")
 }
 
 // JoinBase resolves p against base when p is relative; absolute paths and an empty

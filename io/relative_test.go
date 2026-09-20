@@ -31,6 +31,8 @@ func TestRelativePathHelpers(t *testing.T) {
 		"/w/data/a.parquet":           false,
 		"file:///w/data/a.parquet":    false,
 		"s3://b/w/data/a.parquet":     false,
+		"file:/w/data/a.parquet":      false,
+		"C:/w/data/a.parquet":         false,
 		"":                            false,
 	} {
 		if got := IsRelativePath(p); got != want {
