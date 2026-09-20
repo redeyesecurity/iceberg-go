@@ -188,6 +188,9 @@ func MergeOffloadedSnapshots(m Metadata, fs iceio.IO) error {
 	if fs == nil {
 		return errors.New("snapshot offloading: metadata points at a segment chain but no FileIO was given to read it")
 	}
+	if base := iceio.PathBaseOf(fs); base == "" && iceio.IsRelativePath(c.SnapshotsFile) {
+		return fmt.Errorf("snapshot offloading: the segment pointer %q is warehouse-relative but this FileIO has no base; load the table through the catalog (its properties carry the warehouse)", c.SnapshotsFile)
+	}
 	snaps, logs, _, err := readSegmentChain(fs, iceio.PathBaseOf(fs), c.SnapshotsFile)
 	if err != nil {
 		return err
@@ -251,6 +254,9 @@ func OffloadSnapshots(m Metadata, fs iceio.WriteFileIO, metadataLocation string)
 	var chainLogs []SnapshotLogEntry
 	depth := 0
 	if c.SnapshotsFile != "" {
+		if base == "" && iceio.IsRelativePath(c.SnapshotsFile) {
+			return nil, fmt.Errorf("snapshot offloading: the segment pointer %q is warehouse-relative but this FileIO has no base; write metadata through a FileIO built from the catalog properties (warehouse)", c.SnapshotsFile)
+		}
 		var err error
 		chainSnaps, chainLogs, depth, err = readSegmentChain(fs, base, c.SnapshotsFile)
 		if err != nil {
