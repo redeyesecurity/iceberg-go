@@ -171,18 +171,21 @@ type MetadataBuilder struct {
 	updates []Update
 
 	// common fields
-	formatVersion      int
-	uuid               uuid.UUID
-	loc                string
-	lastUpdatedMS      int64
-	lastColumnId       int
-	schemaList         []*iceberg.Schema
-	currentSchemaID    int
-	specs              []iceberg.PartitionSpec
-	defaultSpecID      int
-	lastPartitionID    *int
-	props              iceberg.Properties
-	snapshotList       []Snapshot
+	formatVersion   int
+	uuid            uuid.UUID
+	loc             string
+	lastUpdatedMS   int64
+	lastColumnId    int
+	schemaList      []*iceberg.Schema
+	currentSchemaID int
+	specs           []iceberg.PartitionSpec
+	defaultSpecID   int
+	lastPartitionID *int
+	props           iceberg.Properties
+	snapshotList    []Snapshot
+	// snapshotsFile carries the offloaded segment pointer (snapshot_offload.go) from the
+	// base metadata into the built one, so the next write appends to the chain.
+	snapshotsFile      string
 	currentSnapshotID  *int64
 	snapshotLog        []SnapshotLogEntry
 	metadataLog        []MetadataLogEntry
@@ -249,6 +252,7 @@ func MetadataBuilderFromBase(metadata Metadata, currentFileLocation string) (*Me
 	b.lastPartitionID = metadata.LastPartitionSpecID()
 	b.props = maps.Clone(metadata.Properties())
 	b.snapshotList = slices.Clone(metadata.Snapshots())
+	b.snapshotsFile = offloadedFile(metadata)
 	b.sortOrderList = slices.Clone(metadata.SortOrders())
 	b.defaultSortOrderID = metadata.DefaultSortOrder()
 	if metadata.Version() > 1 {
@@ -954,6 +958,7 @@ func (b *MetadataBuilder) buildCommonMetadata() (*commonMetadata, error) {
 		LastPartitionID:    b.lastPartitionID,
 		Props:              b.props,
 		SnapshotList:       b.snapshotList,
+		SnapshotsFile:      b.snapshotsFile,
 		CurrentSnapshotID:  b.currentSnapshotID,
 		SnapshotLog:        b.snapshotLog,
 		MetadataLog:        b.metadataLog,
@@ -1424,19 +1429,22 @@ func ParseMetadataBytes(b []byte) (Metadata, error) {
 
 // https://iceberg.apache.org/spec/#iceberg-table-spec
 type commonMetadata struct {
-	FormatVersion      int                       `json:"format-version"`
-	UUID               uuid.UUID                 `json:"table-uuid"`
-	Loc                string                    `json:"location"`
-	LastUpdatedMS      int64                     `json:"last-updated-ms"`
-	LastColumnId       int                       `json:"last-column-id"`
-	SchemaList         []*iceberg.Schema         `json:"schemas"`
-	CurrentSchemaID    int                       `json:"current-schema-id"`
-	Specs              []iceberg.PartitionSpec   `json:"partition-specs"`
-	DefaultSpecID      int                       `json:"default-spec-id"`
-	LastPartitionID    *int                      `json:"last-partition-id,omitempty"`
-	Props              iceberg.Properties        `json:"properties,omitempty"`
-	SnapshotList       []Snapshot                `json:"snapshots,omitempty"`
-	CurrentSnapshotID  *int64                    `json:"current-snapshot-id,omitempty"`
+	FormatVersion     int                     `json:"format-version"`
+	UUID              uuid.UUID               `json:"table-uuid"`
+	Loc               string                  `json:"location"`
+	LastUpdatedMS     int64                   `json:"last-updated-ms"`
+	LastColumnId      int                     `json:"last-column-id"`
+	SchemaList        []*iceberg.Schema       `json:"schemas"`
+	CurrentSchemaID   int                     `json:"current-schema-id"`
+	Specs             []iceberg.PartitionSpec `json:"partition-specs"`
+	DefaultSpecID     int                     `json:"default-spec-id"`
+	LastPartitionID   *int                    `json:"last-partition-id,omitempty"`
+	Props             iceberg.Properties      `json:"properties,omitempty"`
+	SnapshotList      []Snapshot              `json:"snapshots,omitempty"`
+	CurrentSnapshotID *int64                  `json:"current-snapshot-id,omitempty"`
+	// SnapshotsFile points at the head of the offloaded snapshot segment chain
+	// (snapshot_offload.go). Non-standard key; empty on standard tables.
+	SnapshotsFile      string                    `json:"caver-snapshots-file,omitempty"`
 	SnapshotLog        []SnapshotLogEntry        `json:"snapshot-log,omitempty"`
 	MetadataLog        []MetadataLogEntry        `json:"metadata-log,omitempty"`
 	SortOrderList      []SortOrder               `json:"sort-orders"`

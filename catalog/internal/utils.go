@@ -48,6 +48,14 @@ func WriteTableMetadata(metadata table.Metadata, fs icebergio.WriteFileIO, loc s
 		return fmt.Errorf("unsupported write metadata compression codec: %s", compression)
 	}
 
+	// Snapshot offloading (table/snapshot_offload.go): write the segment first, then
+	// the trimmed metadata that points at it. A crash between the two leaves an
+	// unreferenced segment for the orphan sweep and a catalog still on the old file.
+	metadata, err = table.OffloadSnapshots(metadata, fs, loc)
+	if err != nil {
+		return err
+	}
+
 	out, err := fs.Create(loc)
 	if err != nil {
 		return err

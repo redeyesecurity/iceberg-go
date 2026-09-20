@@ -255,6 +255,15 @@ func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 		}
 	}
 
+	// Snapshot offloading: every segment in the chain is live metadata.
+	segs, err := SegmentChainPaths(metadata, fs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the snapshot segment chain: %w", err)
+	}
+	for _, p := range segs {
+		referenced[p] = true
+	}
+
 	for _, snapshot := range metadata.Snapshots() {
 		if snapshot.ManifestList != "" {
 			referenced[iceio.JoinBase(iceio.PathBaseOf(fs), snapshot.ManifestList)] = true

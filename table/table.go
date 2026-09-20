@@ -903,6 +903,11 @@ func NewFromLocation(
 			return nil, err
 		}
 	}
+	// Snapshot offloading: bring the segment chain back so the in-memory metadata is
+	// the full history (snapshot_offload.go).
+	if err := MergeOffloadedSnapshots(meta, fsys); err != nil {
+		return nil, err
+	}
 
 	return New(ident, meta, metalocation, fsysF, cat), nil
 }
