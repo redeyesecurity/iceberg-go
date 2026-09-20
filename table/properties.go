@@ -33,7 +33,14 @@ const (
 	// RelativePathsKey (table property) makes new manifests and manifest lists store
 	// paths relative to the FileIO's base (io.RelativePathsKey, value "warehouse").
 	// Effective only when the table's FileIO carries a base (io.PathBaser).
-	RelativePathsKey          = "write.paths.relative"
+	RelativePathsKey = "write.paths.relative"
+	// RootManifestKey (table property, value "inline") makes each commit write ONE
+	// root manifest (root_manifest.go in the root package) instead of manifests plus
+	// a manifest list; RootManifestInlineMaxKey bounds the inlined section before it
+	// is promoted into child manifests.
+	RootManifestKey           = "caver.metadata.root-manifest"
+	RootManifestInline        = "inline"
+	RootManifestInlineMaxKey  = "caver.metadata.root-manifest.inline-max"
 	ObjectStoreEnabledDefault = false
 
 	DefaultNameMappingKey = "schema.name-mapping.default"

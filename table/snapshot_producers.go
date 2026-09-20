@@ -483,6 +483,11 @@ func newMergeAppendFilesProducer(op Operation, txn *Transaction, fs iceio.WriteF
 }
 
 func (m *mergeAppendFiles) processManifests(manifests []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
+	if m.base.rootMode() {
+		// Root mode does its own consolidation (promotion, root_manifest_producer.go);
+		// merging here would rewrite the inline record into a manifest and lose it.
+		return manifests, nil
+	}
 	unmergedDataManifests, unmergedDeleteManifests := []iceberg.ManifestFile{}, []iceberg.ManifestFile{}
 	for _, m := range manifests {
 		if m.ManifestContent() == iceberg.ManifestContentData {
@@ -653,7 +658,9 @@ func (sp *snapshotProducer) manifests(ctx context.Context) (_ []iceberg.Manifest
 	var deletedFilesManifests []iceberg.ManifestFile
 	var existingManifests []iceberg.ManifestFile
 
-	if len(sp.addedFiles) > 0 {
+	// Root mode (root_manifest_producer.go): added data files are inlined in the root
+	// instead of getting a manifest of their own.
+	if len(sp.addedFiles) > 0 && !sp.rootMode() {
 		g.Go(sp.manifestProducer(iceberg.ManifestContentData, sp.addedFiles, &addedManifests))
 	}
 
@@ -918,32 +925,48 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 	firstRowID := int64(0)
 	var addedRows int64
 
-	out, err := sp.io.Create(manifestListFilePath)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer internal.CheckedClose(out, &err)
-
 	relBase := sp.pathBase()
-	if sp.txn.meta.formatVersion == 3 {
-		firstRowID = sp.txn.meta.NextRowID()
-		writer, err := iceberg.NewManifestListWriterV3(out, sp.snapshotID, nextSequence, firstRowID, parentSnapshot)
-		if err != nil {
-			return nil, nil, err
+	if sp.rootMode() {
+		// ONE file: the root manifest replaces the manifest list and the added-file
+		// manifests. newManifests here is the parent's children plus its inline
+		// record (or the survivors an overwrite rewrote) plus any child this commit
+		// wrote for deletes or delete files.
+		rootPath, rerr := sp.writeRoot(rootInputs{
+			fio: sp.io, parentEntries: newManifests, added: sp.addedFiles,
+			deleted: sp.deletedFiles, snapshotID: sp.snapshotID, sequence: nextSequence,
+			parentID: parentSnapshot, fname: fname,
+		})
+		if rerr != nil {
+			return nil, nil, rerr
 		}
-		defer internal.CheckedClose(writer, &err)
-		writer.SetPathBase(relBase)
-		if err = writer.AddManifests(newManifests); err != nil {
-			return nil, nil, err
-		}
-		if writer.NextRowID() != nil {
-			addedRows = *writer.NextRowID() - firstRowID
-		}
+		manifestListFilePath = rootPath
 	} else {
-		err = iceberg.WriteManifestListWithBase(sp.txn.meta.formatVersion, out,
-			sp.snapshotID, parentSnapshot, &nextSequence, firstRowID, newManifests, relBase)
+		out, err := sp.io.Create(manifestListFilePath)
 		if err != nil {
 			return nil, nil, err
+		}
+		defer internal.CheckedClose(out, &err)
+
+		if sp.txn.meta.formatVersion == 3 {
+			firstRowID = sp.txn.meta.NextRowID()
+			writer, err := iceberg.NewManifestListWriterV3(out, sp.snapshotID, nextSequence, firstRowID, parentSnapshot)
+			if err != nil {
+				return nil, nil, err
+			}
+			defer internal.CheckedClose(writer, &err)
+			writer.SetPathBase(relBase)
+			if err = writer.AddManifests(newManifests); err != nil {
+				return nil, nil, err
+			}
+			if writer.NextRowID() != nil {
+				addedRows = *writer.NextRowID() - firstRowID
+			}
+		} else {
+			err = iceberg.WriteManifestListWithBase(sp.txn.meta.formatVersion, out,
+				sp.snapshotID, parentSnapshot, &nextSequence, firstRowID, newManifests, relBase)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 
@@ -991,6 +1014,18 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 	processManifestsFn := func(m []iceberg.ManifestFile) ([]iceberg.ManifestFile, error) {
 		return sp.processManifests(m)
 	}
+	// Root mode captures for the rebuild closure (root_manifest_producer.go).
+	rootModeFn := sp.rootMode
+	rootWriteFn := sp.writeRoot
+	addedFiles := sp.addedFiles
+	deletedFiles := sp.deletedFiles
+	rootBaseFn := func(fio iceio.WriteFileIO, meta Metadata) string {
+		if meta.Properties().Get(RelativePathsKey, "") == iceio.RelativePathsWarehouse {
+			return iceio.PathBaseOf(fio)
+		}
+
+		return ""
+	}
 
 	rebuildFn := func(_ context.Context, freshMeta Metadata, freshParent *Snapshot, fio iceio.WriteFileIO, attempt int) (_ *Snapshot, retErr error) {
 		// Load inherited manifests from the fresh parent.
@@ -1000,6 +1035,34 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 			if retErr != nil {
 				return nil, fmt.Errorf("rebuild manifest list: load parent manifests: %w", retErr)
 			}
+		}
+
+		if rootModeFn() {
+			// Root mode: a new root over the FRESH parent's children and inlined
+			// entries, plus this commit's own children and added files.
+			var pid *int64
+			if freshParent != nil {
+				id := freshParent.SnapshotID
+				pid = &id
+			}
+			var rootSeq int64
+			if formatVersion >= 2 {
+				rootSeq = freshMeta.LastSequenceNumber() + 1
+			}
+			rootPath, rerr := rootWriteFn(rootInputs{
+				fio: fio, parentEntries: inherited, ownChildren: ownManifests, added: addedFiles,
+				deleted: deletedFiles, snapshotID: snapshotID, sequence: rootSeq, parentID: pid,
+				fname: newManifestListFileName(snapshotID, attempt, commitUUID),
+			})
+			if rerr != nil {
+				return nil, fmt.Errorf("rebuild root manifest: %w", rerr)
+			}
+			rebuilt := capturedSnapshot
+			rebuilt.ManifestList = iceio.RelativizePath(rootBaseFn(fio, freshMeta), rootPath)
+			rebuilt.ParentSnapshotID = pid
+			rebuilt.SequenceNumber = rootSeq
+
+			return &rebuilt, nil
 		}
 
 		// Combine own manifests with inherited ones, applying any
