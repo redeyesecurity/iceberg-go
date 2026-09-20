@@ -257,7 +257,7 @@ func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 
 	for _, snapshot := range metadata.Snapshots() {
 		if snapshot.ManifestList != "" {
-			referenced[snapshot.ManifestList] = true
+			referenced[iceio.JoinBase(iceio.PathBaseOf(fs), snapshot.ManifestList)] = true
 		}
 
 		manifestFiles, err := snapshot.Manifests(fs)

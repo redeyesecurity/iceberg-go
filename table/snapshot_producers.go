@@ -588,6 +588,20 @@ func (sp *snapshotProducer) removeDeleteFile(df iceberg.DataFile) *snapshotProdu
 	return sp
 }
 
+// pathBase is the base new manifests and manifest lists store paths relative to
+// (io.RelativePathsKey): set only when the table property asks for it AND the FileIO
+// can resolve it; otherwise "" and every path is written absolute, as before.
+func (sp *snapshotProducer) pathBase() string {
+	if sp.txn == nil || sp.txn.meta == nil {
+		return ""
+	}
+	if sp.txn.meta.props.Get(RelativePathsKey, "") != iceio.RelativePathsWarehouse {
+		return ""
+	}
+
+	return iceio.PathBaseOf(sp.io)
+}
+
 func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec, opts ...iceberg.ManifestWriterOption) (_ *iceberg.ManifestWriter, _ string, _ *internal.CountingWriter, _ io.Closer, err error) {
 	out, path, err := sp.newManifestOutput()
 	if err != nil {
@@ -595,6 +609,9 @@ func (sp *snapshotProducer) newManifestWriter(spec iceberg.PartitionSpec, opts .
 	}
 
 	counter := &internal.CountingWriter{W: out}
+	if base := sp.pathBase(); base != "" {
+		opts = append(opts, iceberg.WithManifestWriterPathBase(base))
+	}
 	wr, err := iceberg.NewManifestWriter(sp.txn.meta.formatVersion, counter, spec,
 		sp.txn.meta.CurrentSchema(), sp.snapshotID, opts...)
 	if err != nil {
@@ -673,7 +690,8 @@ func (sp *snapshotProducer) manifests(ctx context.Context) (_ []iceberg.Manifest
 				counter := &internal.CountingWriter{W: out}
 				wr, err := iceberg.NewManifestWriter(sp.txn.meta.formatVersion, counter,
 					sp.spec(key.specID), sp.txn.meta.CurrentSchema(),
-					sp.snapshotID, iceberg.WithManifestWriterContent(key.content))
+					sp.snapshotID, iceberg.WithManifestWriterContent(key.content),
+					iceberg.WithManifestWriterPathBase(sp.pathBase()))
 				if err != nil {
 					return nil, err
 				}
@@ -906,6 +924,7 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 	}
 	defer internal.CheckedClose(out, &err)
 
+	relBase := sp.pathBase()
 	if sp.txn.meta.formatVersion == 3 {
 		firstRowID = sp.txn.meta.NextRowID()
 		writer, err := iceberg.NewManifestListWriterV3(out, sp.snapshotID, nextSequence, firstRowID, parentSnapshot)
@@ -913,6 +932,7 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 			return nil, nil, err
 		}
 		defer internal.CheckedClose(writer, &err)
+		writer.SetPathBase(relBase)
 		if err = writer.AddManifests(newManifests); err != nil {
 			return nil, nil, err
 		}
@@ -920,8 +940,8 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 			addedRows = *writer.NextRowID() - firstRowID
 		}
 	} else {
-		err = iceberg.WriteManifestList(sp.txn.meta.formatVersion, out,
-			sp.snapshotID, parentSnapshot, &nextSequence, firstRowID, newManifests)
+		err = iceberg.WriteManifestListWithBase(sp.txn.meta.formatVersion, out,
+			sp.snapshotID, parentSnapshot, &nextSequence, firstRowID, newManifests, relBase)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -931,7 +951,7 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 		SnapshotID:       sp.snapshotID,
 		ParentSnapshotID: parentSnapshot,
 		SequenceNumber:   nextSequence,
-		ManifestList:     manifestListFilePath,
+		ManifestList:     iceio.RelativizePath(relBase, manifestListFilePath),
 		Summary:          &summary,
 		SchemaID:         &sp.txn.meta.currentSchemaID,
 		TimestampMs:      time.Now().UnixMilli(),
@@ -1007,6 +1027,12 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 		// commit succeeds.
 		fname := newManifestListFileName(snapshotID, attempt, commitUUID)
 		manifestListPath := locProvider.NewMetadataLocation(fname)
+		// Same rule as the first write: relative only when the table asks and the
+		// FileIO resolves (io.RelativePathsKey).
+		rebuildBase := ""
+		if freshMeta.Properties().Get(RelativePathsKey, "") == iceio.RelativePathsWarehouse {
+			rebuildBase = iceio.PathBaseOf(fio)
+		}
 
 		out, createErr := fio.Create(manifestListPath)
 		if createErr != nil {
@@ -1032,6 +1058,7 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 				return nil, fmt.Errorf("rebuild manifest list: create v3 writer: %w", wrErr)
 			}
 			defer internal.CheckedClose(writer, &retErr)
+			writer.SetPathBase(rebuildBase)
 			if addErr := writer.AddManifests(combined); addErr != nil {
 				return nil, fmt.Errorf("rebuild manifest list: add manifests: %w", addErr)
 			}
@@ -1039,13 +1066,13 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 				addedRows = *writer.NextRowID() - firstRowID
 			}
 		} else {
-			if wErr := iceberg.WriteManifestList(formatVersion, out, snapshotID, parentID, &newSeq, firstRowID, combined); wErr != nil {
+			if wErr := iceberg.WriteManifestListWithBase(formatVersion, out, snapshotID, parentID, &newSeq, firstRowID, combined, rebuildBase); wErr != nil {
 				return nil, fmt.Errorf("rebuild manifest list: write: %w", wErr)
 			}
 		}
 
 		rebuilt := capturedSnapshot
-		rebuilt.ManifestList = manifestListPath
+		rebuilt.ManifestList = iceio.RelativizePath(rebuildBase, manifestListPath)
 		rebuilt.ParentSnapshotID = parentID
 		rebuilt.SequenceNumber = newSeq
 		if formatVersion == 3 {

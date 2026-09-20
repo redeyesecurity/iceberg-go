@@ -323,13 +323,16 @@ func (s Snapshot) ValidateRowLineage() error {
 
 func (s Snapshot) Manifests(fio iceio.IO) (_ []iceberg.ManifestFile, err error) {
 	if s.ManifestList != "" {
-		f, err := fio.Open(s.ManifestList)
+		// A relative manifest-list path (io.RelativePathsKey) resolves against the
+		// FileIO's base, and so do the manifest and data-file paths beneath it.
+		base := iceio.PathBaseOf(fio)
+		f, err := fio.Open(iceio.JoinBase(base, s.ManifestList))
 		if err != nil {
 			return nil, fmt.Errorf("could not open manifest file: %w", err)
 		}
 		defer internal.CheckedClose(f, &err)
 
-		return iceberg.ReadManifestList(f)
+		return iceberg.ReadManifestListWithBase(f, base)
 	}
 
 	return nil, nil
