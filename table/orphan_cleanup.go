@@ -328,7 +328,7 @@ func (t Table) getReferencedFiles(ctx context.Context, fs iceio.IO, maxConcurren
 	uniqueManifests := make(map[string]iceberg.ManifestFile)
 	for _, snapshot := range metadata.Snapshots() {
 		if snapshot.ManifestList != "" {
-			referenced[normalizeFilePath(snapshot.ManifestList)] = false
+			referenced[normalizeFilePath(iceio.JoinBase(iceio.PathBaseOf(fs), snapshot.ManifestList))] = false
 		}
 
 		manifestFiles, err := snapshot.Manifests(fs)
