@@ -93,6 +93,12 @@ func (t Table) Identifier() Identifier                       { return t.identifi
 func (t Table) Metadata() Metadata                           { return t.metadata }
 func (t Table) MetadataLocation() string                     { return t.metadataLocation }
 func (t Table) FS(ctx context.Context) (icebergio.IO, error) { return t.fsF(ctx) }
+
+// FSFunc returns the FileIO factory this table was loaded with (the catalog's
+// properties, so it carries the warehouse and any relative-path base). A staged
+// table built from an existing one reuses it instead of a FileIO built from table
+// properties, which never carry the warehouse.
+func (t Table) FSFunc() FSysF { return t.fsF }
 func (t Table) Schema() *iceberg.Schema                      { return t.metadata.CurrentSchema() }
 func (t Table) Spec() iceberg.PartitionSpec                  { return t.metadata.PartitionSpec() }
 func (t Table) SortOrder() SortOrder                         { return t.metadata.SortOrder() }

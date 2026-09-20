@@ -239,12 +239,21 @@ func UpdateAndStageTable(ctx context.Context, current *table.Table, ident table.
 		return nil, err
 	}
 
+	// The staged table writes metadata (and, with snapshot offloading, reads the
+	// segment chain) through this FileIO. Table properties never carry the warehouse,
+	// so a FileIO built from them has no base and cannot resolve warehouse-relative
+	// references; reuse the current table's catalog-built FileIO when there is one.
+	fsF := icebergio.LoadFSFunc(updated.Properties(), newLocation)
+	if current != nil && current.FSFunc() != nil {
+		fsF = current.FSFunc()
+	}
+
 	return &table.StagedTable{
 		Table: table.New(
 			ident,
 			updated,
 			newLocation,
-			icebergio.LoadFSFunc(updated.Properties(), newLocation),
+			fsF,
 			cat,
 		),
 	}, nil
