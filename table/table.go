@@ -634,7 +634,7 @@ func rebuildSnapshotUpdates(ctx context.Context, updates []Update, freshMeta Met
 			continue
 		}
 
-		oldManifestList := su.Snapshot.ManifestList
+		oldManifestList := icebergio.JoinBase(icebergio.PathBaseOf(fs), su.Snapshot.ManifestList)
 
 		newSnap, rebuildErr := su.rebuildManifestList(ctx, freshMeta, freshHead, fs, attempt)
 		if rebuildErr != nil {

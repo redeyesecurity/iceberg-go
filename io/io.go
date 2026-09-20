@@ -307,6 +307,12 @@ func LoadFS(ctx context.Context, props map[string]string, location string) (IO, 
 		iofs = LocalFS{}
 	}
 
+	// Relative paths (relative.go): resolve stored relative names against the
+	// warehouse when the properties ask for it.
+	if base := relativeBaseFromProps(props); base != "" {
+		return WrapRelative(iofs, base), nil
+	}
+
 	return iofs, nil
 }
 

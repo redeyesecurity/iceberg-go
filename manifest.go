@@ -255,6 +255,9 @@ type manifestFile struct {
 	FirstRowIDValue    *int64          `avro:"first_row_id"`
 
 	version int `avro:"-"`
+	// pathBase is the base relative data-file paths in this manifest resolve against
+	// (io.RelativeFS); set by ReadManifestListWithBase, "" for absolute-only trees.
+	pathBase string `avro:"-"`
 }
 
 func (m *manifestFile) setVersion(v int) {
@@ -886,6 +889,7 @@ func iterManifest(m ManifestFile, f io.Reader, discardDeleted bool) iter.Seq2[Ma
 			if discardDeleted && entry.Status() == EntryStatusDELETED {
 				continue
 			}
+			joinEntryPath(m, entry)
 			if !yield(entry, nil) {
 				aborted = true
 
@@ -945,6 +949,41 @@ func ReadManifestList(in io.Reader) ([]ManifestFile, error) {
 	}
 
 	return decodeManifests[*manifestFile](rd, version)
+}
+
+// ReadManifestListWithBase is ReadManifestList for a tree written with relative paths
+// (io.RelativePathsKey): every manifest path is resolved against base, and each
+// manifest remembers the base so its data-file paths resolve the same way when its
+// entries are read. An empty base is plain ReadManifestList.
+func ReadManifestListWithBase(in io.Reader, base string) ([]ManifestFile, error) {
+	files, err := ReadManifestList(in)
+	if err != nil || base == "" {
+		return files, err
+	}
+	for _, f := range files {
+		if mf, ok := f.(*manifestFile); ok {
+			mf.Path = iceio.JoinBase(base, mf.Path)
+			mf.pathBase = base
+		}
+	}
+
+	return files, nil
+}
+
+// joinEntryPath resolves a decoded entry's data-file path against the manifest's
+// base, so callers only ever see absolute paths.
+func joinEntryPath(m ManifestFile, entry ManifestEntry) {
+	mf, ok := m.(*manifestFile)
+	if !ok || mf.pathBase == "" {
+		return
+	}
+	me, ok := entry.(*manifestEntry)
+	if !ok {
+		return
+	}
+	if df, ok := me.Data.(*dataFile); ok {
+		df.Path = iceio.JoinBase(mf.pathBase, df.Path)
+	}
 }
 
 type writerImpl interface {
@@ -1178,9 +1217,21 @@ type ManifestWriter struct {
 	partitions  []map[int]any
 	minSeqNum   int64
 	reusedEntry manifestEntry
+
+	// pathBase, when set, makes every written data-file path relative to it
+	// (io.RelativePathsKey). Statistics and partition summaries are unaffected.
+	pathBase string
 }
 
 type ManifestWriterOption func(w *ManifestWriter)
+
+// WithManifestWriterPathBase writes data-file paths relative to base (see
+// io.RelativizePath); paths outside base stay absolute.
+func WithManifestWriterPathBase(base string) ManifestWriterOption {
+	return func(w *ManifestWriter) {
+		w.pathBase = base
+	}
+}
 
 func WithManifestWriterContent(content ManifestContent) ManifestWriterOption {
 	return func(w *ManifestWriter) {
@@ -1358,6 +1409,11 @@ func (w *ManifestWriter) addEntry(entry *manifestEntry) error {
 	if dataFile, ok := entry.DataFile().(*dataFile); ok {
 		encodeDataFile := cloneDataFileAvroFields(dataFile)
 		encodeDataFile.PartitionData = avroEncodePartitionData(partition, w.partFieldNameToID, w.partFieldIDToType)
+		if w.pathBase != "" {
+			// Relative paths (io.RelativePathsKey): strip the base on the encode copy
+			// only; the caller's DataFile keeps its absolute path.
+			encodeDataFile.Path = iceio.RelativizePath(w.pathBase, encodeDataFile.Path)
+		}
 		entryToEncode.Data = encodeDataFile
 	}
 
@@ -1419,6 +1475,19 @@ type ManifestListWriter struct {
 	sequenceNumber   int64
 	writer           *ocf.Writer
 	nextRowID        *int64
+	// pathBase, when set, makes every written manifest path relative to it.
+	pathBase string
+}
+
+// SetPathBase writes manifest paths relative to base (io.RelativizePath).
+func (m *ManifestListWriter) SetPathBase(base string) { m.pathBase = base }
+
+// relativeManifest returns a copy of f with its path relative to the writer's base.
+func (m *ManifestListWriter) relativeManifest(f *manifestFile) manifestFile {
+	cp := *f
+	cp.Path = iceio.RelativizePath(m.pathBase, cp.Path)
+
+	return cp
 }
 
 func NewManifestListWriterV1(out io.Writer, snapshotID int64, parentSnapshot *int64) (*ManifestListWriter, error) {
@@ -1530,7 +1599,8 @@ func (m *ManifestListWriter) AddManifests(files []ManifestFile) error {
 
 		var tmp manifestFileV1
 		for _, file := range files {
-			file.(*manifestFile).toV1(&tmp)
+			rel := m.relativeManifest(file.(*manifestFile))
+			rel.toV1(&tmp)
 			if err := m.writer.Encode(&tmp); err != nil {
 				return err
 			}
@@ -1552,7 +1622,7 @@ func (m *ManifestListWriter) AddManifests(files []ManifestFile) error {
 					ErrInvalidArgument, m.version, file.Version())
 			}
 
-			wrapped := *(file.(*manifestFile))
+			wrapped := m.relativeManifest(file.(*manifestFile))
 			if m.version == 3 {
 				// Ref: https://github.com/apache/iceberg/blob/ea2071568dc66148b483a82eefedcd2992b435f7/core/src/main/java/org/apache/iceberg/ManifestListWriter.java#L157-L168
 				if wrapped.Content == ManifestContentData {
@@ -1599,6 +1669,12 @@ func (m *ManifestListWriter) AddManifests(files []ManifestFile) error {
 
 // WriteManifestList writes a list of manifest files to an avro file.
 func WriteManifestList(version int, out io.Writer, snapshotID int64, parentSnapshotID, sequenceNumber *int64, firstRowId int64, files []ManifestFile) (err error) {
+	return WriteManifestListWithBase(version, out, snapshotID, parentSnapshotID, sequenceNumber, firstRowId, files, "")
+}
+
+// WriteManifestListWithBase is WriteManifestList writing manifest paths relative to
+// base (io.RelativePathsKey); "" writes them as given.
+func WriteManifestListWithBase(version int, out io.Writer, snapshotID int64, parentSnapshotID, sequenceNumber *int64, firstRowId int64, files []ManifestFile, base string) (err error) {
 	var writer *ManifestListWriter
 
 	switch version {
@@ -1622,6 +1698,7 @@ func WriteManifestList(version int, out io.Writer, snapshotID int64, parentSnaps
 		return err
 	}
 	defer internal.CheckedClose(writer, &err)
+	writer.SetPathBase(base)
 
 	return writer.AddManifests(files)
 }
