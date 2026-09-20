@@ -756,7 +756,7 @@ func (sp *snapshotProducer) manifestProducer(content iceberg.ManifestContent, fi
 		}
 		wr, err := iceberg.NewManifestWriter(sp.txn.meta.formatVersion, counter,
 			*currentSpec, sp.txn.meta.CurrentSchema(),
-			sp.snapshotID, iceberg.WithManifestWriterContent(content))
+			sp.snapshotID, iceberg.WithManifestWriterContent(content), iceberg.WithManifestWriterPathBase(sp.pathBase()))
 		if err != nil {
 			return err
 		}
