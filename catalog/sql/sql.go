@@ -344,7 +344,21 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 		return current.Metadata(), current.MetadataLocation(), nil
 	}
 
-	if err := internal.WriteMetadata(ctx, staged.Metadata(), staged.MetadataLocation(), staged.Properties()); err != nil {
+	// Write through the staged table's own FileIO (built from the CATALOG properties,
+	// like CreateTable above), not a FileIO built from table properties: only the
+	// catalog properties carry the warehouse, and with relative paths or snapshot
+	// offloading the writer must resolve warehouse-relative references (the segment
+	// chain head) while it writes.
+	afs, err := staged.FS(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	wfs, ok := afs.(io.WriteFileIO)
+	if !ok {
+		return nil, "", errors.New("loaded filesystem IO does not support writing")
+	}
+	compression := staged.Properties().Get(table.MetadataCompressionKey, table.MetadataCompressionDefault)
+	if err := internal.WriteTableMetadata(staged.Metadata(), wfs, staged.MetadataLocation(), compression); err != nil {
 		return nil, "", err
 	}
 
