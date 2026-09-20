@@ -486,7 +486,7 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 			return errors.New("snapshot should never be nil")
 		}
 
-		filesToDelete[snap.ManifestList] = struct{}{}
+		filesToDelete[io.JoinBase(io.PathBaseOf(prefs), snap.ManifestList)] = struct{}{}
 	}
 
 	expiredIDs := make(map[int64]struct{}, len(u.SnapshotIDs))

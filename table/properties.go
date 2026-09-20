@@ -30,7 +30,11 @@ const (
 	WriteObjectStorePartitionedPathsKey     = "write.object-storage.partitioned-paths"
 	WriteObjectStorePartitionedPathsDefault = true
 	ObjectStoreEnabledKey                   = "write.object-storage.enabled"
-	ObjectStoreEnabledDefault               = false
+	// RelativePathsKey (table property) makes new manifests and manifest lists store
+	// paths relative to the FileIO's base (io.RelativePathsKey, value "warehouse").
+	// Effective only when the table's FileIO carries a base (io.PathBaser).
+	RelativePathsKey          = "write.paths.relative"
+	ObjectStoreEnabledDefault = false
 
 	DefaultNameMappingKey = "schema.name-mapping.default"
 
