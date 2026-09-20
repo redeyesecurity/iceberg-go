@@ -258,6 +258,9 @@ type manifestFile struct {
 	// pathBase is the base relative data-file paths in this manifest resolve against
 	// (io.RelativeFS); set by ReadManifestListWithBase, "" for absolute-only trees.
 	pathBase string `avro:"-"`
+	// inlineRoot marks the in-memory record of a root manifest's inlined section
+	// (root_manifest.go): Path is the root file, which is itself a valid manifest.
+	inlineRoot bool `avro:"-"`
 }
 
 func (m *manifestFile) setVersion(v int) {
@@ -1170,6 +1173,16 @@ type ManifestWriter struct {
 	// pathBase, when set, makes every written data-file path relative to it
 	// (io.RelativePathsKey). Statistics and partition summaries are unaffected.
 	pathBase string
+	// extraMeta is merged into the OCF header (root_manifest.go).
+	extraMeta map[string][]byte
+	// allowEmpty lets Close succeed with no entries: a root manifest whose inlined
+	// section is empty is still the snapshot's entry point (root_manifest.go).
+	allowEmpty bool
+}
+
+// WithManifestWriterAllowEmpty lets the writer close with zero entries.
+func WithManifestWriterAllowEmpty() ManifestWriterOption {
+	return func(w *ManifestWriter) { w.allowEmpty = true }
 }
 
 type ManifestWriterOption func(w *ManifestWriter)
@@ -1255,7 +1268,7 @@ func (w *ManifestWriter) Close() error {
 		return nil
 	}
 
-	if w.addedFiles+w.existingFiles+w.deletedFiles == 0 {
+	if w.addedFiles+w.existingFiles+w.deletedFiles == 0 && !w.allowEmpty {
 		return errors.New("empty manifest file has been written")
 	}
 
@@ -1330,14 +1343,19 @@ func (w *ManifestWriter) meta() (map[string][]byte, error) {
 		return nil, err
 	}
 
-	return map[string][]byte{
+	md := map[string][]byte{
 		"schema":            schemaJson,
 		"schema-id":         []byte(strconv.Itoa(w.schema.ID)),
 		"partition-spec":    specFieldsJson,
 		"partition-spec-id": []byte(strconv.Itoa(w.spec.ID())),
 		"format-version":    []byte(strconv.Itoa(w.version)),
 		"content":           []byte(w.content.String()),
-	}, nil
+	}
+	for k, v := range w.extraMeta {
+		md[k] = v
+	}
+
+	return md, nil
 }
 
 func (w *ManifestWriter) addEntry(entry *manifestEntry) error {

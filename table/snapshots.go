@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"maps"
 	"slices"
@@ -326,13 +327,20 @@ func (s Snapshot) Manifests(fio iceio.IO) (_ []iceberg.ManifestFile, err error) 
 		// A relative manifest-list path (io.RelativePathsKey) resolves against the
 		// FileIO's base, and so do the manifest and data-file paths beneath it.
 		base := iceio.PathBaseOf(fio)
-		f, err := fio.Open(iceio.JoinBase(base, s.ManifestList))
+		full := iceio.JoinBase(base, s.ManifestList)
+		f, err := fio.Open(full)
 		if err != nil {
 			return nil, fmt.Errorf("could not open manifest file: %w", err)
 		}
 		defer internal.CheckedClose(f, &err)
+		// The entry point is a manifest list or, with RootManifestKey, a root manifest
+		// (iceberg.ReadRootOrManifestList decides from the file's own header).
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return nil, fmt.Errorf("could not read manifest list: %w", err)
+		}
 
-		return iceberg.ReadManifestListWithBase(f, base)
+		return iceberg.ReadRootOrManifestList(data, full, base)
 	}
 
 	return nil, nil
