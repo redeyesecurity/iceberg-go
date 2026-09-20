@@ -98,16 +98,16 @@ func (t Table) FS(ctx context.Context) (icebergio.IO, error) { return t.fsF(ctx)
 // properties, so it carries the warehouse and any relative-path base). A staged
 // table built from an existing one reuses it instead of a FileIO built from table
 // properties, which never carry the warehouse.
-func (t Table) FSFunc() FSysF { return t.fsF }
-func (t Table) Schema() *iceberg.Schema                      { return t.metadata.CurrentSchema() }
-func (t Table) Spec() iceberg.PartitionSpec                  { return t.metadata.PartitionSpec() }
-func (t Table) SortOrder() SortOrder                         { return t.metadata.SortOrder() }
-func (t Table) Properties() iceberg.Properties               { return t.metadata.Properties() }
-func (t Table) NameMapping() iceberg.NameMapping             { return t.metadata.NameMapping() }
-func (t Table) Location() string                             { return t.metadata.Location() }
-func (t Table) CurrentSnapshot() *Snapshot                   { return t.metadata.CurrentSnapshot() }
-func (t Table) SnapshotByID(id int64) *Snapshot              { return t.metadata.SnapshotByID(id) }
-func (t Table) SnapshotByName(name string) *Snapshot         { return t.metadata.SnapshotByName(name) }
+func (t Table) FSFunc() FSysF                        { return t.fsF }
+func (t Table) Schema() *iceberg.Schema              { return t.metadata.CurrentSchema() }
+func (t Table) Spec() iceberg.PartitionSpec          { return t.metadata.PartitionSpec() }
+func (t Table) SortOrder() SortOrder                 { return t.metadata.SortOrder() }
+func (t Table) Properties() iceberg.Properties       { return t.metadata.Properties() }
+func (t Table) NameMapping() iceberg.NameMapping     { return t.metadata.NameMapping() }
+func (t Table) Location() string                     { return t.metadata.Location() }
+func (t Table) CurrentSnapshot() *Snapshot           { return t.metadata.CurrentSnapshot() }
+func (t Table) SnapshotByID(id int64) *Snapshot      { return t.metadata.SnapshotByID(id) }
+func (t Table) SnapshotByName(name string) *Snapshot { return t.metadata.SnapshotByName(name) }
 func (t Table) Schemas() map[int]*iceberg.Schema {
 	m := make(map[int]*iceberg.Schema)
 	for _, s := range t.metadata.Schemas() {
