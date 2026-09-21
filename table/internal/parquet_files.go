@@ -65,6 +65,18 @@ const (
 	ParquetBloomFilterMaxBytesKey            = "write.parquet.bloom-filter-max-bytes"
 	ParquetBloomFilterMaxBytesDefault        = 1024 * 1024
 	ParquetBloomFilterColumnEnabledKeyPrefix = "write.parquet.bloom-filter-enabled.column"
+	// ParquetBloomFilterAdaptiveEnabledKey sizes each bloom filter from the values the
+	// row group actually holds (arrow-go's adaptive block-split filter) instead of
+	// allocating bloom-filter-max-bytes per column up front. Without it a 16-row file
+	// carries max-bytes of near-empty bitset per bloom column (caver-go#4640).
+	ParquetBloomFilterAdaptiveEnabledKey     = "write.parquet.bloom-filter-adaptive-enabled"
+	ParquetBloomFilterAdaptiveEnabledDefault = false
+	// ParquetBloomFilterCandidatesKey is how many candidate sizes the adaptive filter
+	// keeps, each half the previous from max-bytes down; the smallest candidate that
+	// still covers the observed distinct count is written. 5 candidates from 1 MiB
+	// bottom out at 64 KiB; 16 reach the 32-byte minimum.
+	ParquetBloomFilterCandidatesKey     = "write.parquet.bloom-filter-candidates"
+	ParquetBloomFilterCandidatesDefault = 5
 
 	// REDEYE PATCH (write.parquet.dictionary-enabled): table property that toggles
 	// Parquet dictionary encoding. Upstream v0.6.0 hardcodes dictionary OFF in
@@ -329,6 +341,12 @@ func (parquetFormat) GetWriteProperties(props iceberg.Properties) any {
 	// write.parquet.bloom-filter-max-bytes caps the per-column bloom filter size.
 	bloomMaxBytes := props.GetInt(ParquetBloomFilterMaxBytesKey, ParquetBloomFilterMaxBytesDefault)
 	writerProps = append(writerProps, parquet.WithMaxBloomFilterBytes(int64(bloomMaxBytes)))
+	if props.GetBool(ParquetBloomFilterAdaptiveEnabledKey, ParquetBloomFilterAdaptiveEnabledDefault) {
+		writerProps = append(writerProps, parquet.WithAdaptiveBloomFilterEnabled(true))
+	}
+	if n := props.GetInt(ParquetBloomFilterCandidatesKey, ParquetBloomFilterCandidatesDefault); n != ParquetBloomFilterCandidatesDefault && n > 0 {
+		writerProps = append(writerProps, parquet.WithBloomFilterCandidates(n))
+	}
 
 	// write.parquet.bloom-filter-enabled.column.<col-name> enables bloom filters
 	// for individual columns. Scan all properties for the prefix.

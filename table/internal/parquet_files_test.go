@@ -731,6 +731,20 @@ func TestGetWritePropertiesBloomFilter(t *testing.T) {
 		assert.Equal(t, int64(2097152), wp.MaxBloomFilterBytes())
 	})
 
+	t.Run("adaptive bloom filter and candidates", func(t *testing.T) {
+		wp := parquet.NewWriterProperties(format.GetWriteProperties(iceberg.Properties{}).([]parquet.WriterProperty)...)
+		assert.False(t, wp.AdaptiveBloomFilterEnabledFor("id"), "adaptive stays off by default")
+		assert.Equal(t, parquet.DefaultBloomFilterCandidates, wp.BloomFilterCandidatesFor("id"))
+
+		props := iceberg.Properties{
+			internal.ParquetBloomFilterAdaptiveEnabledKey: "true",
+			internal.ParquetBloomFilterCandidatesKey:      "16",
+		}
+		wp = parquet.NewWriterProperties(format.GetWriteProperties(props).([]parquet.WriterProperty)...)
+		assert.True(t, wp.AdaptiveBloomFilterEnabledFor("id"))
+		assert.Equal(t, 16, wp.BloomFilterCandidatesFor("id"))
+	})
+
 	t.Run("per-column bloom filter enabled", func(t *testing.T) {
 		props := iceberg.Properties{
 			internal.ParquetBloomFilterColumnEnabledKeyPrefix + ".id":   "true",
