@@ -616,12 +616,11 @@ type ManifestReader struct {
 // file. If the caller is interested in the manifest entries in the file, it must call
 // [ManifestReader.Entries] before closing the provided reader.
 func NewManifestReader(file ManifestFile, in io.Reader) (*ManifestReader, error) {
-	rd, err := ocf.NewReader(in)
+	rd, metadata, err := newOCFReader(in)
 	if err != nil {
 		return nil, err
 	}
 
-	metadata := rd.Metadata()
 	sc := rd.Schema()
 
 	formatVersion := 1
@@ -875,7 +874,7 @@ func ReadManifest(m ManifestFile, f io.Reader, discardDeleted bool) ([]ManifestE
 func ReadManifestList(in io.Reader) ([]ManifestFile, error) {
 	var version int
 
-	rd, err := ocf.NewReader(in, ocf.WithReaderSchemaFunc(func(rd *ocf.Reader) (*avro.Schema, error) {
+	rd, _, err := newOCFReader(in, ocf.WithReaderSchemaFunc(func(rd *ocf.Reader) (*avro.Schema, error) {
 		version = 1
 		if raw := rd.Metadata()["format-version"]; len(raw) > 0 {
 			v, err := strconv.Atoi(string(raw))

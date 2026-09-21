@@ -18,12 +18,11 @@
 package iceberg
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
-
-	"github.com/twmb/avro/ocf"
 
 	iceio "github.com/apache/iceberg-go/io"
 )
@@ -83,11 +82,13 @@ type rootHeader struct {
 // false for an ordinary manifest list. The reader's position is undefined afterwards;
 // callers re-seek.
 func readRootHeader(r io.Reader) (_ *rootHeader, ok bool, err error) {
-	rd, err := ocf.NewReader(r)
+	// The header is parsed here rather than by the avro library: a root's child
+	// list can exceed the library's 1 MiB per-value cap (ocf_header.go, #4493).
+	h0, err := readOCFHeader(bufio.NewReader(r))
 	if err != nil {
 		return nil, false, err
 	}
-	meta := rd.Metadata()
+	meta := h0.meta
 	if string(meta[RootManifestMarkerKey]) != "1" {
 		return nil, false, nil
 	}
