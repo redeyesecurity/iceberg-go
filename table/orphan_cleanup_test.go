@@ -20,6 +20,7 @@ package table
 import (
 	"context"
 	"errors"
+	stdfs "io/fs"
 	"testing"
 	"time"
 
@@ -749,3 +750,34 @@ func dataFilePathsFromSnapshot(
 
 	return paths
 }
+
+// A file that vanishes between listing and visiting (another writer dropped its table
+// mid-scan, caver-go#4535) is skipped, and a vanished directory is skipped whole; any
+// other error still fails the walk.
+func TestOrphanWalkSkipsEntriesThatVanished(t *testing.T) {
+	var seen []string
+	walk := makeFileWalkFunc(func(path string, info stdfs.FileInfo) error {
+		seen = append(seen, path)
+		return nil
+	}, func(p string) string { return p })
+
+	if err := walk("/w/t/data/gone.parquet", nil, stdfs.ErrNotExist); err != nil {
+		t.Fatalf("vanished file must be skipped, got %v", err)
+	}
+	if err := walk("/w/t/data/gone-dir", vanishedDir{}, stdfs.ErrNotExist); err != stdfs.SkipDir {
+		t.Fatalf("vanished directory must be skipped whole, got %v", err)
+	}
+	if err := walk("/w/t/data/x.parquet", nil, errors.New("permission denied")); err == nil {
+		t.Fatal("other errors must still fail the walk")
+	}
+	if len(seen) != 0 {
+		t.Fatalf("no file should have been visited, got %v", seen)
+	}
+}
+
+type vanishedDir struct{}
+
+func (vanishedDir) Name() string                  { return "gone-dir" }
+func (vanishedDir) IsDir() bool                   { return true }
+func (vanishedDir) Type() stdfs.FileMode          { return stdfs.ModeDir }
+func (vanishedDir) Info() (stdfs.FileInfo, error) { return nil, stdfs.ErrNotExist }

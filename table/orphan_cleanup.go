@@ -326,6 +326,16 @@ func walkDirectory(fsys iceio.IO, root string, fn func(path string, info stdfs.F
 	if listable, ok := fsys.(iceio.ListableIO); ok {
 		return listable.WalkDir(root, func(path string, d stdfs.DirEntry, err error) error {
 			if err != nil {
+				// A file or directory listed a moment ago and gone by the time it is
+				// visited is the normal case while another writer drops a table under
+				// the same warehouse (caver-go#4535); skip it rather than fail the
+				// whole scan. A vanished file is by definition not an orphan to delete.
+				if errors.Is(err, stdfs.ErrNotExist) {
+					if d != nil && d.IsDir() {
+						return stdfs.SkipDir
+					}
+					return nil
+				}
 				return err
 			}
 
@@ -335,6 +345,9 @@ func walkDirectory(fsys iceio.IO, root string, fn func(path string, info stdfs.F
 
 			info, err := d.Info()
 			if err != nil {
+				if errors.Is(err, stdfs.ErrNotExist) {
+					return nil
+				}
 				return err
 			}
 
@@ -386,6 +399,14 @@ func getBucketName(fsys iceio.IO) stdfs.FS {
 func makeFileWalkFunc(fn func(path string, info stdfs.FileInfo) error, pathTransform func(string) string) stdfs.WalkDirFunc {
 	return func(path string, d stdfs.DirEntry, err error) error {
 		if err != nil {
+			// Same rule as the ListableIO walk (caver-go#4535): an entry that vanished
+			// between listing and visiting is skipped, not fatal.
+			if errors.Is(err, stdfs.ErrNotExist) {
+				if d != nil && d.IsDir() {
+					return stdfs.SkipDir
+				}
+				return nil
+			}
 			return err
 		}
 
@@ -395,6 +416,9 @@ func makeFileWalkFunc(fn func(path string, info stdfs.FileInfo) error, pathTrans
 
 		info, err := d.Info()
 		if err != nil {
+			if errors.Is(err, stdfs.ErrNotExist) {
+				return nil
+			}
 			return err
 		}
 
