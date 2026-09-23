@@ -37,6 +37,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// inheritedFilter is implemented by producers whose snapshot replaces some of the
+// parent's manifests, so the OCC rebuild must not carry those from the fresh parent.
+type inheritedFilter interface {
+	filterInherited(parent []iceberg.ManifestFile) ([]iceberg.ManifestFile, error)
+}
+
 type producerImpl interface {
 	// to perform any post-processing on the manifests before writing them
 	// to the new snapshot. This will be called as the last step
@@ -1034,6 +1040,14 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 			inherited, retErr = freshParent.Manifests(fio)
 			if retErr != nil {
 				return nil, fmt.Errorf("rebuild manifest list: load parent manifests: %w", retErr)
+			}
+		}
+		// A producer that replaces parent manifests (rewrite_manifests.go) drops its
+		// sources from the fresh parent, or refuses when one is gone; carrying them
+		// next to their replacements would plan every file twice.
+		if f, ok := sp.producerImpl.(inheritedFilter); ok {
+			if inherited, retErr = f.filterInherited(inherited); retErr != nil {
+				return nil, fmt.Errorf("rebuild manifest list: %w", retErr)
 			}
 		}
 
