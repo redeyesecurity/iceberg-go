@@ -127,7 +127,11 @@ func CreateStagedTable(ctx context.Context, catprops iceberg.Properties, nsprops
 		return table.StagedTable{}, err
 	}
 
-	metadata, err := table.NewMetadata(sc, cfg.PartitionSpec, cfg.SortOrder, loc, cfg.Properties)
+	newMetadata := table.NewMetadata
+	if cfg.PreserveFieldIDs {
+		newMetadata = table.NewMetadataPreservingIDs
+	}
+	metadata, err := newMetadata(sc, cfg.PartitionSpec, cfg.SortOrder, loc, cfg.Properties)
 	if err != nil {
 		return table.StagedTable{}, err
 	}

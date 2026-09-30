@@ -88,6 +88,12 @@ type CreateTableCfg struct {
 	// with an assert-create requirement and all updates atomically.
 	// Non-REST catalogs ignore this field.
 	StagedUpdates []table.Update
+	// PreserveFieldIDs (caver-go#3867) makes CreateTable honor the field ids
+	// already set on the schema instead of discarding them via
+	// iceberg.AssignFreshSchemaIDs, which renumbers every node by pre-order
+	// rank. Set it when schema was built from a hand-maintained id registry
+	// that must survive a fresh create verbatim; see WithPreserveFieldIDs.
+	PreserveFieldIDs bool
 }
 
 func NewCreateTableCfg() CreateTableCfg {
@@ -226,6 +232,19 @@ func WithProperties(props iceberg.Properties) CreateTableOpt {
 func WithStagedUpdates(updates ...table.Update) CreateTableOpt {
 	return func(cfg *CreateTableCfg) {
 		cfg.StagedUpdates = append(cfg.StagedUpdates, updates...)
+	}
+}
+
+// WithPreserveFieldIDs makes CreateTable honor the field ids already set on
+// the schema verbatim, instead of discarding them and renumbering every node
+// by pre-order rank (the AssignFreshSchemaIDs default). Use it when the
+// schema is a complete, hand-maintained id registry rather than a
+// builder-style schema with placeholder ids: every field, and every
+// list/map element, must already carry its own final positive id, or
+// CreateTable returns an error rather than create a table with an invalid id.
+func WithPreserveFieldIDs() CreateTableOpt {
+	return func(cfg *CreateTableCfg) {
+		cfg.PreserveFieldIDs = true
 	}
 }
 

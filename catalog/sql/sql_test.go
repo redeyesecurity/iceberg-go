@@ -374,6 +374,46 @@ func (s *SqliteCatalogTestSuite) TestCreateTableDefaultSortOrder() {
 	}
 }
 
+// TestCreateTablePreserveFieldIDs covers caver-go#3867 through the actual
+// catalog caver-go uses: WithPreserveFieldIDs makes CreateTable hand out the
+// schema's own declared ids instead of renumbering by pre-order rank, all
+// the way through CreateStagedTable's real SQL-catalog registration (not
+// just the table package unit tests). tableSchemaNested's nested list
+// element (ID 5) sits where a bare pre-order create would instead assign the
+// id belonging to the field after it, so a regression back to
+// AssignFreshSchemaIDs would be caught here by the ids not matching input.
+func (s *SqliteCatalogTestSuite) TestCreateTablePreserveFieldIDs() {
+	tests := []struct {
+		cat   *sqlcat.Catalog
+		tblID table.Identifier
+	}{
+		{s.getCatalogMemory(), s.randomTableIdentifier()},
+		{s.getCatalogSqlite(), s.randomHierarchicalIdentifier()},
+	}
+
+	for _, tt := range tests {
+		ns := catalog.NamespaceFromIdent(tt.tblID)
+		s.Require().NoError(tt.cat.CreateNamespace(context.Background(), ns, nil))
+		tbl, err := tt.cat.CreateTable(context.Background(), tt.tblID, tableSchemaNested,
+			catalog.WithPreserveFieldIDs())
+		s.Require().NoError(err)
+
+		got := tbl.Schema()
+		for _, want := range tableSchemaNested.Fields() {
+			field, ok := got.FindFieldByID(want.ID)
+			s.Require().Truef(ok, "declared field id %d (%s) missing from the created table", want.ID, want.Name)
+			s.Equal(want.Name, field.Name)
+		}
+		quxField, ok := got.FindFieldByName("qux")
+		s.Require().True(ok)
+		quxList, ok := quxField.Type.(*iceberg.ListType)
+		s.Require().True(ok)
+		s.Equal(5, quxList.ElementID)
+
+		s.NoError(tt.cat.DropTable(context.Background(), tt.tblID))
+	}
+}
+
 func (s *SqliteCatalogTestSuite) TestCreateV1Table() {
 	tests := []struct {
 		cat   *sqlcat.Catalog
