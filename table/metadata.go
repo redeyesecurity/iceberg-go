@@ -2187,6 +2187,29 @@ func NewMetadata(sc *iceberg.Schema, partitions *iceberg.PartitionSpec, sortOrde
 
 // NewMetadataWithUUID is like NewMetadata, but allows the caller to specify the UUID of the table rather than creating a new one.
 func NewMetadataWithUUID(sc *iceberg.Schema, partitions *iceberg.PartitionSpec, sortOrder SortOrder, location string, props iceberg.Properties, tableUuid uuid.UUID) (Metadata, error) {
+	return newMetadataWithUUID(sc, partitions, sortOrder, location, props, tableUuid, false)
+}
+
+// NewMetadataPreservingIDs is like NewMetadata, but honors the field ids
+// already set on sc instead of discarding them and renumbering every node by
+// pre-order rank (caver-go#3867). The caller is asserting sc is a complete,
+// hand-assigned schema - every field, and every list/map element, already
+// carries its own final positive id - not a builder-style schema with
+// placeholder ids meant to be assigned here. NewSchema's own duplicate-id
+// check already rejects a colliding registry when sc was constructed;
+// newMetadataWithUUID additionally rejects any id <= 0, since that is what a
+// placeholder schema looks like and preserving it verbatim would silently
+// hand out invalid field ids.
+func NewMetadataPreservingIDs(sc *iceberg.Schema, partitions *iceberg.PartitionSpec, sortOrder SortOrder, location string, props iceberg.Properties) (Metadata, error) {
+	return NewMetadataWithUUIDPreservingIDs(sc, partitions, sortOrder, location, props, uuid.Nil)
+}
+
+// NewMetadataWithUUIDPreservingIDs is NewMetadataPreservingIDs with a caller-specified UUID; see NewMetadataWithUUID.
+func NewMetadataWithUUIDPreservingIDs(sc *iceberg.Schema, partitions *iceberg.PartitionSpec, sortOrder SortOrder, location string, props iceberg.Properties, tableUuid uuid.UUID) (Metadata, error) {
+	return newMetadataWithUUID(sc, partitions, sortOrder, location, props, tableUuid, true)
+}
+
+func newMetadataWithUUID(sc *iceberg.Schema, partitions *iceberg.PartitionSpec, sortOrder SortOrder, location string, props iceberg.Properties, tableUuid uuid.UUID, preserveIDs bool) (Metadata, error) {
 	if tableUuid == uuid.Nil {
 		tableUuid = uuid.New()
 	}
@@ -2202,7 +2225,7 @@ func NewMetadataWithUUID(sc *iceberg.Schema, partitions *iceberg.PartitionSpec, 
 		}
 	}
 
-	reassignedIds, err := reassignIDs(sc, partitions, sortOrder)
+	reassignedIds, err := reassignIDs(sc, partitions, sortOrder, preserveIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -2257,11 +2280,17 @@ type ReassignedIds struct {
 	sortOrder     SortOrder
 }
 
-func reassignIDs(sc *iceberg.Schema, partitions *iceberg.PartitionSpec, sortOrder SortOrder) (*ReassignedIds, error) {
+func reassignIDs(sc *iceberg.Schema, partitions *iceberg.PartitionSpec, sortOrder SortOrder, preserveIDs bool) (*ReassignedIds, error) {
 	previousMapFn := sc.FindColumnName
-	freshSc, err := iceberg.AssignFreshSchemaIDs(sc, nil)
-	if err != nil {
-		return nil, err
+	freshSc := sc
+	if !preserveIDs {
+		var err error
+		freshSc, err = iceberg.AssignFreshSchemaIDs(sc, nil)
+		if err != nil {
+			return nil, err
+		}
+	} else if err := requirePositiveFieldIDs(sc); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidMetadata, err)
 	}
 
 	if partitions == nil {
@@ -2291,6 +2320,54 @@ func reassignIDs(sc *iceberg.Schema, partitions *iceberg.PartitionSpec, sortOrde
 		partitionSpec: &freshPartitions,
 		sortOrder:     freshSortOrder,
 	}, nil
+}
+
+// requirePositiveFieldIDs walks sc and every nested list/map/struct field and
+// rejects any id <= 0. AssignFreshSchemaIDs tolerates (and expects) a
+// builder-style schema whose fields carry non-positive placeholder ids; a
+// caller asking to PRESERVE ids instead is asserting the schema is already
+// final, so a placeholder slipping through here would otherwise become a
+// permanent, invalid field id on the created table instead of a build-time
+// error.
+func requirePositiveFieldIDs(sc *iceberg.Schema) error {
+	return requirePositiveFieldIDsInList(sc.Fields())
+}
+
+func requirePositiveFieldIDsInList(fields []iceberg.NestedField) error {
+	for _, f := range fields {
+		if f.ID <= 0 {
+			return fmt.Errorf("%w: field %q has non-positive id %d, so its ids cannot be preserved as-is", iceberg.ErrInvalidSchema, f.Name, f.ID)
+		}
+		if err := requirePositiveFieldIDsInType(f.Type); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func requirePositiveFieldIDsInType(t iceberg.Type) error {
+	switch tt := t.(type) {
+	case *iceberg.StructType:
+		return requirePositiveFieldIDsInList(tt.FieldList)
+	case *iceberg.ListType:
+		if tt.ElementID <= 0 {
+			return fmt.Errorf("%w: list element has non-positive id %d, so its ids cannot be preserved as-is", iceberg.ErrInvalidSchema, tt.ElementID)
+		}
+
+		return requirePositiveFieldIDsInType(tt.Element)
+	case *iceberg.MapType:
+		if tt.KeyID <= 0 || tt.ValueID <= 0 {
+			return fmt.Errorf("%w: map key/value has non-positive id (%d/%d), so its ids cannot be preserved as-is", iceberg.ErrInvalidSchema, tt.KeyID, tt.ValueID)
+		}
+		if err := requirePositiveFieldIDsInType(tt.KeyType); err != nil {
+			return err
+		}
+
+		return requirePositiveFieldIDsInType(tt.ValueType)
+	default:
+		return nil
+	}
 }
 
 func UpdateTableMetadata(base Metadata, updates []Update, metadataLoc string) (Metadata, error) {

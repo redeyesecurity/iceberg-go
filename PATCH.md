@@ -178,3 +178,88 @@ The second row is the shape caver-go actually writes, since its lake sorts on
 the host dimension. Both are a synthetic corpus: they establish that the knob
 works and that delta is not a pessimisation on interleaved data. What it is
 worth on the estate has to be measured on real files after it is deployed.
+
+## 4. `CreateTable` honors declared field ids: `catalog.WithPreserveFieldIDs()`
+
+caver-go#3867: two different functions in this codebase assign Iceberg field
+ids and disagreed. A fresh `CreateTable` hands the schema to the catalog,
+which upstream unconditionally runs through `iceberg.AssignFreshSchemaIDs`,
+discarding every id the caller declared and renumbering each node by its
+PRE-ORDER RANK. caver-go's own additive-evolution path
+(`internal/lake/schema_evolve.go`) never renumbers anything and mints new
+ids from `live.HighestFieldID()+1` instead. The two agree only when a new
+field lands last in a full pre-order walk of the whole schema - the entire,
+previously-undocumented "you can only append at the trailing group" rule.
+
+caver-go maintains `internal/lake/schema.go` as a single, hand-reviewed
+field-id registry (constants like `FieldIDEHRPath = 9`, with nested leaves
+declared 300-305) specifically so a field's id is a stable, deliberate fact
+about the schema, not an accident of where it sits in the struct. A fresh
+create threw that away: `ehr_path`'s declared 300-305 came out of
+`CreateTable` as 76-81, silently. That is what forced every schema
+extension to land at the very end of the whole tree, closing off earlier
+groups (`ehr_path`, then `process_lineage`, then `rf`) to further growth one
+at a time.
+
+### The patch
+
+`catalog.CreateTableCfg` gains a `PreserveFieldIDs bool` field and a
+`catalog.WithPreserveFieldIDs()` `CreateTableOpt`. When set, `CreateTable`
+uses the schema's own field ids verbatim instead of calling
+`iceberg.AssignFreshSchemaIDs`:
+
+- `table.NewMetadataPreservingIDs` / `NewMetadataWithUUIDPreservingIDs`
+  (`table/metadata.go`) are new functions mirroring `NewMetadata` /
+  `NewMetadataWithUUID`, threading a `preserveIDs bool` into `reassignIDs`
+  instead of changing those two functions' existing signatures.
+- `reassignIDs`, when `preserveIDs` is true, skips `AssignFreshSchemaIDs`
+  and uses the input schema as its own "fresh" schema for the downstream
+  partition-spec and sort-order id remapping (which already works by
+  resolving names against the schema, so it needs no other change).
+- A new guard, `requirePositiveFieldIDs`, walks the schema (including list
+  and map elements) and rejects any id `<= 0` before preserving it. A
+  builder-style schema with unassigned placeholder ids (negative, by this
+  library's own convention - see `checkDuplicateFieldIDs` in `schema.go`)
+  was never meant to be preserved verbatim; without this guard, passing one
+  with `PreserveFieldIDs` would silently create a table with invalid field
+  ids instead of failing at creation time.
+- `catalog/internal.CreateStagedTable` (the shared staging path both the SQL
+  and Hadoop catalogs use) picks `table.NewMetadataPreservingIDs` over
+  `table.NewMetadata` when `cfg.PreserveFieldIDs` is set.
+
+`catalog/rest` and `catalog/hive` call `iceberg.AssignFreshSchemaIDs`
+directly rather than through `table.NewMetadata`/`reassignIDs`, and are
+UNCHANGED by this patch: caver-go only ever constructs its catalog via
+`catalog/sql` (`internal/lake/iceberg.go`), so those two call sites are out
+of scope here. A future user of `PreserveFieldIDs` against a REST or Hive
+catalog would need the same option threaded through those two call sites
+first; it isn't, and `WithPreserveFieldIDs()` is silently ignored by both
+today (matches every other `CreateTableOpt` field they don't read).
+
+### How caver-go uses it
+
+`internal/lake/iceberg.go`'s `CreateTable` passes `catalog.WithPreserveFieldIDs()`
+alongside its existing options, so the OCSF events table now gets exactly the
+ids `internal/lake/schema.go` declares - the registry is the fresh-create
+output, not a suggestion a pre-order walk overrides.
+
+### What this does NOT do: existing tables keep their old ids
+
+A table created before this patch already has ITS ids baked into every
+parquet file it holds (Iceberg resolves columns by id; nothing can safely
+renumber a live table). This patch only changes what a *fresh* `CreateTable`
+produces - an old table is never touched, is never fresh-created again
+(`CreateTable` is idempotent and routes an existing table through schema
+evolution, not creation), and keeps disagreeing with a fresh create by
+design. `internal/doctor/check_lake.go`'s `lake.schema_identity` check
+(caver-go#3864) accounts for this by testing a live table against BOTH
+candidate id schemes (declared and legacy pre-order) and comparing against
+whichever one it actually matches, rather than assuming every table was
+created under today's scheme.
+
+### Testing
+
+`go test ./table/... ./catalog/...` (all green, including the two new
+`table` unit tests and the new `catalog/sql` integration test that exercises
+`WithPreserveFieldIDs()` through the real SQL-catalog `CreateTable` path
+caver-go uses).

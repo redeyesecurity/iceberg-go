@@ -2152,3 +2152,63 @@ func TestMetadataV3EmitsNullCurrentSnapshotID(t *testing.T) {
 		assert.Nil(t, v3.CurrentSnapshotID, "explicit null must parse back to nil")
 	})
 }
+
+// TestNewMetadataPreservingIDs covers caver-go#3867: a fresh create honoring
+// a hand-maintained id registry instead of renumbering by pre-order rank.
+// The schema below deliberately gives the nested struct's children ids far
+// above what pre-order numbering would assign them (mirroring the real
+// registry: ehr_path's leaves are declared 300-305 while a bare
+// AssignFreshSchemaIDs create gives them 76-81), so a regression back to
+// fresh-id assignment would be caught by the ids no longer matching input.
+func TestNewMetadataPreservingIDs(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: 2, Name: "group", Required: false, Type: &iceberg.StructType{
+			FieldList: []iceberg.NestedField{
+				{ID: 300, Name: "leaf_a", Type: iceberg.PrimitiveTypes.String, Required: false},
+				{ID: 301, Name: "leaf_b", Type: iceberg.PrimitiveTypes.String, Required: false},
+			},
+		}},
+		iceberg.NestedField{ID: 3, Name: "tags", Required: false, Type: &iceberg.ListType{
+			ElementID: 400, Element: iceberg.PrimitiveTypes.String, ElementRequired: false,
+		}},
+	)
+
+	meta, err := NewMetadataPreservingIDs(schema, nil, UnsortedSortOrder, "s3://bucket/table", nil)
+	require.NoError(t, err)
+
+	got := meta.CurrentSchema()
+	require.NoError(t, err)
+
+	groupField, ok := got.FindFieldByName("group")
+	require.True(t, ok)
+	groupStruct, ok := groupField.Type.(*iceberg.StructType)
+	require.True(t, ok)
+	assert.Equal(t, 300, groupStruct.FieldList[0].ID)
+	assert.Equal(t, 301, groupStruct.FieldList[1].ID)
+
+	tagsField, ok := got.FindFieldByName("tags")
+	require.True(t, ok)
+	tagsList, ok := tagsField.Type.(*iceberg.ListType)
+	require.True(t, ok)
+	assert.Equal(t, 400, tagsList.ElementID)
+
+	idField, ok := got.FindFieldByName("id")
+	require.True(t, ok)
+	assert.Equal(t, 1, idField.ID)
+}
+
+// TestNewMetadataPreservingIDsRejectsPlaceholderIDs covers the guard added
+// alongside PreserveFieldIDs: a schema carrying a non-positive (placeholder)
+// id is a builder-style schema that was never meant to be preserved
+// verbatim, so this must fail loud rather than hand out an invalid field id.
+func TestNewMetadataPreservingIDsRejectsPlaceholderIDs(t *testing.T) {
+	schema := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64, Required: true},
+		iceberg.NestedField{ID: -1, Name: "unassigned", Type: iceberg.PrimitiveTypes.String, Required: false},
+	)
+
+	_, err := NewMetadataPreservingIDs(schema, nil, UnsortedSortOrder, "s3://bucket/table", nil)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, iceberg.ErrInvalidSchema)
+}
