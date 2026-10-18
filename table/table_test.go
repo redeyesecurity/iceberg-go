@@ -31,7 +31,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -2890,7 +2889,7 @@ func createMetadataFile(metadatadir, metadataFile string) error {
 	return err
 }
 
-func (t *TableWritingTestSuite) TestDeleteOldMetadataLogsErrorOnFileNotFound() {
+func (t *TableWritingTestSuite) TestDeleteOldMetadataIsSilentOnFileNotFound() {
 	// capture logs to validate that no error is logged
 	var logBuf bytes.Buffer
 	log.SetOutput(&logBuf)
@@ -2927,14 +2926,52 @@ func (t *TableWritingTestSuite) TestDeleteOldMetadataLogsErrorOnFileNotFound() {
 	_, err = tx_new.Commit(ctx)
 	t.Require().NoError(err)
 
-	// validate that error is logged
+	// A file that is already gone is what the delete wanted, so nothing is
+	// logged for it (caver-go#9384: a peer writer had already removed it).
+	logOutput := logBuf.String()
+	t.NotContains(logOutput, "Warning: Failed to delete old metadata file")
+}
+
+func (t *TableWritingTestSuite) TestDeleteOldMetadataLogsErrorOnOtherFailure() {
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr) // restore default output
+
+	fs := iceio.LocalFS{}
+	files := make([]string, 0)
+	for i := range 5 {
+		filePath := fmt.Sprintf("%s/file_v%d/data-%d.parquet", t.location, t.formatVersion, i)
+		t.writeParquet(fs, filePath, t.arrTablePromotedTypes)
+		files = append(files, filePath)
+	}
+
+	ident := table.Identifier{"default", "file_v" + strconv.Itoa(t.formatVersion)}
+	meta, err := table.NewMetadata(t.tableSchemaPromotedTypes, iceberg.UnpartitionedSpec,
+		table.UnsortedSortOrder, t.location, iceberg.Properties{table.PropertyFormatVersion: strconv.Itoa(t.formatVersion), "write.metadata.delete-after-commit.enabled": "true"})
+	t.Require().NoError(err)
+
+	tbl := table.New(ident, meta, t.getMetadataLoc(), func(ctx context.Context) (iceio.IO, error) {
+		return fs, nil
+	}, &DeleteOldMetadataMockedCatalog{meta})
+	ctx := context.Background()
+
+	tx := tbl.NewTransaction()
+	tx.AddFiles(ctx, files[0:1], nil, false)
+	tbl_new, err := tx.Commit(ctx)
+	t.Require().NoError(err)
+
+	// The old metadata path is a non-empty directory, so the remove fails
+	// with something other than not-exist, and that is still logged.
+	t.Require().NoError(os.MkdirAll(filepath.Join(tbl_new.MetadataLocation(), "child"), 0o755))
+
+	tx_new := tbl_new.NewTransaction()
+	tx_new.AddFiles(ctx, files[1:2], nil, false)
+	_, err = tx_new.Commit(ctx)
+	t.Require().NoError(err)
+
 	logOutput := logBuf.String()
 	t.Contains(logOutput, "Warning: Failed to delete old metadata file")
-	if runtime.GOOS == "windows" {
-		t.Contains(logOutput, "The system cannot find the file specified")
-	} else {
-		t.Contains(logOutput, "no such file or directory")
-	}
+	t.Contains(logOutput, tbl_new.MetadataLocation())
 }
 
 func (t *TableWritingTestSuite) TestDeleteOldMetadataNoErrorLogsOnFileFound() {
