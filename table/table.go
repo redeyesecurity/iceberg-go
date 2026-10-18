@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	stdfs "io/fs"
 	"iter"
 	"log"
 	"math/rand/v2"
@@ -39,6 +40,7 @@ import (
 	icebergio "github.com/apache/iceberg-go/io"
 	tblutils "github.com/apache/iceberg-go/table/internal"
 	"github.com/klauspost/compress/zstd"
+	"gocloud.dev/gcerrors"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -536,7 +538,13 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 		return nil, err
 	}
 
-	deleteOldMetadata(fs, t.metadata, newMeta)
+	// The cleanup diffs against current, the base this commit was built on,
+	// and not t.metadata. After a retry t.metadata is the pre-conflict view,
+	// and its metadata log still names files a peer's commit already trimmed
+	// and deleted, so every writer that lost a race would delete them again
+	// (caver-go#9384). Java's BaseMetastoreTableOperations uses the refreshed
+	// base the same way.
+	deleteOldMetadata(fs, current, newMeta)
 
 	return New(t.identifier, newMeta, newLoc, t.fsF, t.cat), nil
 }
@@ -735,11 +743,25 @@ func deleteOldMetadata(fs icebergio.IO, baseMeta, newMeta Metadata) {
 
 		for _, file := range toRemove {
 			if err := fs.Remove(file); err != nil {
-				// Log the error instead of raising it when deleting old metadata files, as an external entity like a compactor may have already deleted them
+				// A file that is already gone is the outcome the delete wanted. A
+				// compactor may have removed it, or a peer writer whose commit the
+				// catalog rebased trimmed the same entry (caver-go#9384), so it is
+				// not worth a line. Any other error is logged instead of raised:
+				// the commit itself has already landed.
+				if isNotExist(err) {
+					continue
+				}
 				log.Printf("Warning: Failed to delete old metadata file: %s error: %v", file, err)
 			}
 		}
 	}
+}
+
+// isNotExist reports whether err says the file was not there. LocalFS
+// returns an os.PathError wrapping fs.ErrNotExist, and a gocloud bucket
+// returns its own NotFound code, which does not wrap it.
+func isNotExist(err error) bool {
+	return errors.Is(err, stdfs.ErrNotExist) || gcerrors.Code(err) == gcerrors.NotFound
 }
 
 type ScanOption func(*Scan)
