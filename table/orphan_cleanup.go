@@ -82,6 +82,9 @@ type orphanCleanupConfig struct {
 
 type OrphanCleanupOption func(*orphanCleanupConfig)
 
+// WithLocation names the orphan scan root explicitly. It is honoured as given and
+// skips the anchoring DeleteOrphanFiles otherwise applies, so the caller owns the
+// choice: a root wider than the table sweeps whatever else lives under it.
 func WithLocation(location string) OrphanCleanupOption {
 	return func(cfg *orphanCleanupConfig) {
 		cfg.location = location
@@ -170,9 +173,11 @@ var ErrOrphanScanRefused = errors.New("orphan scan root does not agree with the 
 // was loaded from, the path the catalog pointer named, which the file's
 // contents cannot move. The parsed location must name that same directory; if
 // it does not, or there is no loaded path to anchor on, the scan is refused
-// with ErrOrphanScanRefused rather than guessed. A table that keeps its
-// metadata outside <location>/metadata (write.metadata.path) is refused the
-// same way: pass WithLocation to name the root explicitly.
+// with ErrOrphanScanRefused rather than guessed. A table whose loaded metadata
+// directory is not named metadata (write.metadata.path moved it) is refused
+// before any comparison, because the parent of such a directory can be a
+// warehouse or a shared metadata root that a planted location would agree
+// with: pass WithLocation to name the root explicitly.
 //
 // The parsed location is what gets scanned once it agrees, spelled as the
 // table spells it, so the walk and the referenced set normalise exactly as
@@ -187,6 +192,13 @@ func orphanScanRoot(fsBase, location, loadedLoc string) (string, error) {
 		return "", fmt.Errorf("%w: loaded metadata directory %q has no parent", ErrOrphanScanRefused, metaDir)
 	}
 	root := metaDir[:i]
+	// The loaded directory must BE <location>/metadata. Without this, a table that
+	// keeps its metadata elsewhere (write.metadata.path, say s3://b/meta/t) could have
+	// location planted onto that directory's parent (s3://b/meta) and agree, making the
+	// scan root a warehouse or a shared metadata root that holds every other table.
+	if metaDir[i+1:] != "metadata" {
+		return "", fmt.Errorf("%w: loaded metadata directory %q is not <location>/metadata, name the root with WithLocation", ErrOrphanScanRefused, metaDir)
+	}
 	if location == "" || !sameStorageDir(root, iceio.JoinBase(fsBase, location)) {
 		return "", fmt.Errorf("%w: loaded from %q, the metadata names location %q", ErrOrphanScanRefused, metaDir, location)
 	}
@@ -200,6 +212,12 @@ type OrphanCleanupResult struct {
 	TotalSizeBytes      int64
 }
 
+// DeleteOrphanFiles lists, and unless WithDryRun deletes, files under the scan
+// root that no snapshot references. Without WithLocation the root is anchored to
+// the metadata file the table was loaded from (see orphanScanRoot): a table with
+// no loaded path, whose metadata lives outside <location>/metadata, or whose
+// location disagrees with that file is refused with ErrOrphanScanRefused and
+// nothing is listed or deleted.
 func (t Table) DeleteOrphanFiles(ctx context.Context, opts ...OrphanCleanupOption) (OrphanCleanupResult, error) {
 	cfg := &orphanCleanupConfig{
 		location:           "",             // empty means use table's data location

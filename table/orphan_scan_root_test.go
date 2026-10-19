@@ -113,6 +113,10 @@ func TestOrphanScanRoot(t *testing.T) {
 		{name: "parent", location: "s3://b/w", loaded: "s3://b/w/t/metadata/v3.metadata.json"},
 		{name: "dot dot", location: "s3://b/w/t/../hot", loaded: "s3://b/w/t/metadata/v3.metadata.json"},
 		{name: "custom metadata path", location: "s3://b/w/t", loaded: "s3://b/meta/t/v3.metadata.json"},
+		// F1 on #24: the same table with location planted onto the parent of its
+		// metadata dir agreed and made the scan root s3://b/meta, every table's metadata.
+		{name: "custom metadata path, location planted on its parent", location: "s3://b/meta", loaded: "s3://b/meta/t/v3.metadata.json"},
+		{name: "metadata dir not named metadata, file warehouse", location: "file:///wh", loaded: "/wh/tmeta/v3.metadata.json"},
 		{name: "empty location", location: "", loaded: "s3://b/w/t/metadata/v3.metadata.json"},
 		{name: "no loaded path", location: "s3://b/w/t", loaded: ""},
 		{name: "bare file name", location: "s3://b/w/t", loaded: "v1.metadata.json"},
