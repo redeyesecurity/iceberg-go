@@ -188,7 +188,7 @@ func (r *rewriteManifests) existingManifests() ([]iceberg.ManifestFile, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rewrite manifests: parent snapshot %d: %w", r.base.parentSnapshotID, err)
 	}
-	parent, err := snap.Manifests(r.base.io)
+	parent, err := snap.Manifests(r.base.readIO)
 	if err != nil {
 		return nil, err
 	}

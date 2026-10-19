@@ -103,7 +103,7 @@ func (fa *fastAppendFiles) existingManifests() ([]iceberg.ManifestFile, error) {
 		return nil, fmt.Errorf("could not find parent snapshot %d: %w", fa.base.parentSnapshotID, err)
 	}
 
-	return previous.Manifests(fa.base.io)
+	return previous.Manifests(fa.base.readIO)
 }
 
 func (fa *fastAppendFiles) deletedEntries(_ context.Context) ([]iceberg.ManifestEntry, error) {
@@ -165,7 +165,7 @@ func (of *overwriteFiles) existingManifests() ([]iceberg.ManifestFile, error) {
 		return existingFiles, nil
 	}
 
-	manifestList, err := snap.Manifests(of.base.io)
+	manifestList, err := snap.Manifests(of.base.readIO)
 	if err != nil {
 		return existingFiles, err
 	}
@@ -293,7 +293,7 @@ func (of *overwriteFiles) deletedEntries(ctx context.Context) ([]iceberg.Manifes
 		return nil, fmt.Errorf("%w: cannot overwrite empty table", err)
 	}
 
-	previousManifests, err := parent.Manifests(of.base.io)
+	previousManifests, err := parent.Manifests(of.base.readIO)
 	if err != nil {
 		return nil, err
 	}
@@ -525,6 +525,7 @@ type snapshotProducer struct {
 
 	commitUuid         uuid.UUID
 	io                 iceio.WriteFileIO
+	readIO             iceio.IO // io wrapped by the table's ManifestReadIO: what the parent's manifests are read through
 	txn                *Transaction
 	op                 Operation
 	snapshotID         int64
@@ -555,6 +556,7 @@ func createSnapshotProducer(op Operation, txn *Transaction, fs iceio.WriteFileIO
 
 	return &snapshotProducer{
 		commitUuid:         commit,
+		readIO:             txn.tbl.manifestIO(fs),
 		io:                 fs,
 		txn:                txn,
 		op:                 op,
@@ -875,7 +877,7 @@ func (sp *snapshotProducer) computeOwnManifests(allManifests []iceberg.ManifestF
 		return nil, fmt.Errorf("%w: computeOwnManifests parent id %d", ErrSnapshotNotFound, sp.parentSnapshotID)
 	}
 
-	parentManifests, err := parent.Manifests(sp.io)
+	parentManifests, err := parent.Manifests(sp.readIO)
 	if err != nil {
 		return nil, fmt.Errorf("computeOwnManifests: read parent manifests: %w", err)
 	}
@@ -1033,11 +1035,12 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 		return ""
 	}
 
+	manifestIO := sp.txn.tbl.manifestIO // the retry's fresh FileIO is read through the same hook
 	rebuildFn := func(_ context.Context, freshMeta Metadata, freshParent *Snapshot, fio iceio.WriteFileIO, attempt int) (_ *Snapshot, retErr error) {
 		// Load inherited manifests from the fresh parent.
 		var inherited []iceberg.ManifestFile
 		if freshParent != nil {
-			inherited, retErr = freshParent.Manifests(fio)
+			inherited, retErr = freshParent.Manifests(manifestIO(fio))
 			if retErr != nil {
 				return nil, fmt.Errorf("rebuild manifest list: load parent manifests: %w", retErr)
 			}
@@ -1180,13 +1183,13 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 	addSnap.rebuildManifestList = rebuildFn
 
 	return []Update{
-			addSnap,
-			// Use 0 (not -1) for the optional fields so they are omitted by
-			// `omitempty` in JSON marshalling. -1 is a sentinel meaning
-			// "no limit" internally, but strict catalogs such as AWS S3 Tables
-			// reject a payload that explicitly contains negative values.
-			NewSetSnapshotRefUpdate(branch, sp.snapshotID, BranchRef, 0, 0, 0),
-		}, []Requirement{
-			AssertRefSnapshotID(branch, sp.txn.meta.currentSnapshotID),
-		}, nil
+		addSnap,
+		// Use 0 (not -1) for the optional fields so they are omitted by
+		// `omitempty` in JSON marshalling. -1 is a sentinel meaning
+		// "no limit" internally, but strict catalogs such as AWS S3 Tables
+		// reject a payload that explicitly contains negative values.
+		NewSetSnapshotRefUpdate(branch, sp.snapshotID, BranchRef, 0, 0, 0),
+	}, []Requirement{
+		AssertRefSnapshotID(branch, sp.txn.meta.currentSnapshotID),
+	}, nil
 }

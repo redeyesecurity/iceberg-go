@@ -83,6 +83,35 @@ type Table struct {
 	metadataLocation string
 	cat              CatalogIO
 	fsF              FSysF
+	manifestReadIO   ManifestReadIO
+}
+
+// ManifestReadIO wraps the FileIO a commit READS the parent snapshot's manifest list
+// and manifests through (the snapshot producers' existingManifests, the merge
+// manager's inherited set, the rebuild on a commit retry). The commit still writes
+// through the FileIO it was given. A catalog that holds stored paths to a rule (the
+// RedEye lake catalog: a manifest list or manifest is under the table location, see
+// caver-go#9457 and #9520) installs its checked reader here with WithManifestReadIO,
+// so a manifest list rewritten in place after the last check is refused before the
+// producer decodes it. nil means the commit reads through its own FileIO.
+type ManifestReadIO func(fs icebergio.IO) icebergio.IO
+
+// WithManifestReadIO is t with f wrapping every commit-time manifest read. The
+// returned table shares t's metadata, catalog and FileIO; transactions opened on it
+// carry f.
+func (t Table) WithManifestReadIO(f ManifestReadIO) *Table {
+	t.manifestReadIO = f
+
+	return &t
+}
+
+// manifestIO is fs wrapped by the table's ManifestReadIO, or fs itself.
+func (t Table) manifestIO(fs icebergio.IO) icebergio.IO {
+	if t.manifestReadIO != nil {
+		return t.manifestReadIO(fs)
+	}
+
+	return fs
 }
 
 func (t Table) Equals(other Table) bool {
@@ -148,6 +177,7 @@ func (t *Table) Refresh(ctx context.Context) error {
 
 	t.metadata = fresh.metadata
 	t.fsF = fresh.fsF
+	// The reader hook is this process's, not the catalog's: a refresh keeps it.
 	t.metadataLocation = fresh.metadataLocation
 
 	return nil
