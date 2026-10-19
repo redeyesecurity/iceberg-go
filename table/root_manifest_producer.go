@@ -61,6 +61,7 @@ func rootInlineMax(props iceberg.Properties) int {
 // parent instead of the one the commit planned against.
 type rootInputs struct {
 	fio           iceio.WriteFileIO
+	readIO        iceio.IO                    // fio through the table's ManifestReadIO: what the parent's inline entries are read through
 	parentEntries []iceberg.ManifestFile      // the parent's Manifests(): children plus its inline record
 	ownChildren   []iceberg.ManifestFile      // manifests this commit wrote (deletes, delete files, promotions)
 	added         []iceberg.DataFile          // data files this commit adds, inlined
@@ -112,7 +113,7 @@ func (sp *snapshotProducer) writeRoot(in rootInputs) (_ string, err error) {
 	// keep their own snapshot id and sequence), then ours as ADDED.
 	var carried []iceberg.ManifestEntry
 	if parentInline != nil {
-		for entry, ierr := range parentInline.Entries(in.fio, true) {
+		for entry, ierr := range parentInline.Entries(in.readIO, true) {
 			if ierr != nil {
 				return "", fmt.Errorf("root manifest: read parent inline entries: %w", ierr)
 			}

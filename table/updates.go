@@ -477,6 +477,10 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 	if err != nil {
 		return err
 	}
+	// The expired and surviving snapshots' lists and manifests are read through the
+	// table's ManifestReadIO (a planted entry must not drive a Remove of a foreign
+	// object); the removes themselves go through prefs.
+	rfs := preTable.manifestIO(prefs)
 
 	filesToDelete := make(map[string]struct{})
 
@@ -512,7 +516,7 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 			return errors.New("missing snapshot")
 		}
 
-		mans, err := snap.Manifests(prefs)
+		mans, err := snap.Manifests(rfs)
 		if err != nil {
 			return err
 		}
@@ -520,7 +524,7 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		for _, man := range mans {
 			filesToDelete[man.FilePath()] = struct{}{}
 
-			for entry, err := range man.Entries(prefs, false) {
+			for entry, err := range man.Entries(rfs, false) {
 				if err != nil {
 					return err
 				}
@@ -530,7 +534,7 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 	}
 
 	for _, snap := range postTable.Metadata().Snapshots() {
-		mans, err := snap.Manifests(prefs)
+		mans, err := snap.Manifests(rfs)
 		if err != nil {
 			return err
 		}
@@ -538,7 +542,7 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		for _, man := range mans {
 			delete(filesToDelete, man.FilePath())
 
-			for entry, err := range man.Entries(prefs, false) {
+			for entry, err := range man.Entries(rfs, false) {
 				if err != nil {
 					return err
 				}

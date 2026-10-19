@@ -117,7 +117,7 @@ func (t *Transaction) RewriteManifests(ctx context.Context, snapshotProps iceber
 	if err != nil {
 		return res, err
 	}
-	parent, err := snap.Manifests(fs)
+	parent, err := snap.Manifests(t.tbl.manifestIO(fs)) // source selection reads the parent through the hook
 	if err != nil {
 		return res, fmt.Errorf("rewrite manifests: read current manifests: %w", err)
 	}
@@ -237,7 +237,7 @@ func (r *rewriteManifests) writeClustered(sources []iceberg.ManifestFile) ([]ice
 	var st RewriteManifestsResult
 	bySpec := map[int32][]iceberg.ManifestEntry{}
 	for _, m := range sources {
-		for e, err := range m.Entries(r.base.io, true) {
+		for e, err := range m.Entries(r.base.readIO, true) {
 			if err != nil {
 				return nil, st, fmt.Errorf("rewrite manifests: read %s: %w", m.FilePath(), err)
 			}

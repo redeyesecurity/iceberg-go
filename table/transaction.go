@@ -446,7 +446,7 @@ func (t *Transaction) ReplaceDataFiles(ctx context.Context, filesToDelete, files
 		return err
 	}
 	markedForDeletion := make([]iceberg.DataFile, 0, len(setToDelete))
-	for df, err := range s.dataFiles(fs, nil) {
+	for df, err := range s.dataFiles(t.tbl.manifestIO(fs), nil) {
 		if err != nil {
 			return err
 		}
@@ -687,7 +687,7 @@ func (t *Transaction) AddDataFiles(ctx context.Context, dataFiles []iceberg.Data
 	if !cfg.skipDuplicateCheck {
 		if s := t.meta.currentSnapshot(); s != nil {
 			referenced := make([]string, 0)
-			for df, err := range s.dataFiles(fs, nil) {
+			for df, err := range s.dataFiles(t.tbl.manifestIO(fs), nil) {
 				if err != nil {
 					return err
 				}
@@ -785,7 +785,7 @@ func (t *Transaction) ReplaceDataFilesWithDataFiles(ctx context.Context, filesTo
 	}
 
 	markedForDeletion := make([]iceberg.DataFile, 0, len(setToDelete))
-	for df, err := range s.dataFiles(fs, nil) {
+	for df, err := range s.dataFiles(t.tbl.manifestIO(fs), nil) {
 		if err != nil {
 			return err
 		}
@@ -901,7 +901,7 @@ func (t *Transaction) ReplaceFiles(ctx context.Context, dataFilesToDelete, dataF
 	// that all files to delete/remove actually exist in the table.
 	markedDataForDeletion := make([]iceberg.DataFile, 0, len(setToDelete))
 	markedDeleteForRemoval := make([]iceberg.DataFile, 0, len(setDeleteFilesToRemove))
-	for df, err := range s.dataFiles(fs, nil) {
+	for df, err := range s.dataFiles(t.tbl.manifestIO(fs), nil) {
 		if err != nil {
 			return err
 		}
@@ -1000,7 +1000,7 @@ func (t *Transaction) AddFiles(ctx context.Context, filePaths []string, snapshot
 			if err != nil {
 				return err
 			}
-			for df, err := range s.dataFiles(fs, nil) {
+			for df, err := range s.dataFiles(t.tbl.manifestIO(fs), nil) {
 				if err != nil {
 					return err
 				}
@@ -1363,7 +1363,7 @@ func (t *Transaction) classifyFilesForDeletions(ctx context.Context, fs io.IO, f
 	}
 
 	if filter == nil || filter.Equals(iceberg.AlwaysTrue{}) {
-		for df, err := range s.dataFiles(fs, nil) {
+		for df, err := range s.dataFiles(t.tbl.manifestIO(fs), nil) {
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1429,7 +1429,7 @@ func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs 
 	s := t.meta.currentSnapshot()
 	var manifests []iceberg.ManifestFile
 	if s != nil {
-		manifests, err = s.Manifests(fs)
+		manifests, err = s.Manifests(t.tbl.manifestIO(fs))
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to get manifests: %w", err)
 		}
@@ -1457,7 +1457,7 @@ func (t *Transaction) classifyFilesForFilteredDeletions(ctx context.Context, fs 
 			localDelete := make([]iceberg.DataFile, 0)
 			localRewrite := make([]iceberg.DataFile, 0)
 
-			for entry, err := range manifest.Entries(fs, false) {
+			for entry, err := range manifest.Entries(t.tbl.manifestIO(fs), false) {
 				if err != nil {
 					return fmt.Errorf("failed to fetch manifest entries: %w", err)
 				}

@@ -650,7 +650,7 @@ func (sp *snapshotProducer) newManifestOutput() (io.WriteCloser, string, error) 
 }
 
 func (sp *snapshotProducer) iterManifestEntries(m iceberg.ManifestFile, discardDeleted bool) iter.Seq2[iceberg.ManifestEntry, error] {
-	return m.Entries(sp.io, discardDeleted)
+	return m.Entries(sp.readIO, discardDeleted) // the parent's manifest files, through the hook like its list
 }
 
 func (sp *snapshotProducer) manifests(ctx context.Context) (_ []iceberg.ManifestFile, err error) {
@@ -940,7 +940,7 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 		// record (or the survivors an overwrite rewrote) plus any child this commit
 		// wrote for deletes or delete files.
 		rootPath, rerr := sp.writeRoot(rootInputs{
-			fio: sp.io, parentEntries: newManifests, added: sp.addedFiles,
+			fio: sp.io, readIO: sp.readIO, parentEntries: newManifests, added: sp.addedFiles,
 			deleted: sp.deletedFiles, snapshotID: sp.snapshotID, sequence: nextSequence,
 			parentID: parentSnapshot, fname: fname,
 		})
@@ -1067,7 +1067,7 @@ func (sp *snapshotProducer) commit(ctx context.Context) (_ []Update, _ []Require
 				rootSeq = freshMeta.LastSequenceNumber() + 1
 			}
 			rootPath, rerr := rootWriteFn(rootInputs{
-				fio: fio, parentEntries: inherited, ownChildren: ownManifests, added: addedFiles,
+				fio: fio, readIO: manifestIO(fio), parentEntries: inherited, ownChildren: ownManifests, added: addedFiles,
 				deleted: deletedFiles, snapshotID: snapshotID, sequence: rootSeq, parentID: pid,
 				fname: newManifestListFileName(snapshotID, attempt, commitUUID),
 			})
