@@ -22,8 +22,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
+	"log"
 	"slices"
+	"sort"
+	"strings"
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/io"
@@ -477,6 +479,12 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 	if err != nil {
 		return err
 	}
+	// The expired and surviving snapshots' lists and manifests are read through the
+	// table's ManifestReadIO; the removes go through prefs, and each path is held to
+	// the table root before it is removed (below), so a planted entry cannot drive a
+	// Remove of a foreign object whether it came from a list, a manifest or the
+	// metadata's own statistics fields.
+	rfs := preTable.manifestIO(prefs)
 
 	filesToDelete := make(map[string]struct{})
 
@@ -512,7 +520,7 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 			return errors.New("missing snapshot")
 		}
 
-		mans, err := snap.Manifests(prefs)
+		mans, err := snap.Manifests(rfs)
 		if err != nil {
 			return err
 		}
@@ -520,7 +528,7 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		for _, man := range mans {
 			filesToDelete[man.FilePath()] = struct{}{}
 
-			for entry, err := range man.Entries(prefs, false) {
+			for entry, err := range man.Entries(rfs, false) {
 				if err != nil {
 					return err
 				}
@@ -530,7 +538,7 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 	}
 
 	for _, snap := range postTable.Metadata().Snapshots() {
-		mans, err := snap.Manifests(prefs)
+		mans, err := snap.Manifests(rfs)
 		if err != nil {
 			return err
 		}
@@ -538,7 +546,7 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		for _, man := range mans {
 			delete(filesToDelete, man.FilePath())
 
-			for entry, err := range man.Entries(prefs, false) {
+			for entry, err := range man.Entries(rfs, false) {
 				if err != nil {
 					return err
 				}
@@ -561,7 +569,41 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 		return nil
 	}
 
-	paths := slices.Collect(maps.Keys(filesToDelete))
+	// Every path is held to the table root, anchored on the metadata file the writer
+	// loaded (the parent of its directory), the way deleteOldMetadata holds the
+	// metadata log (caver-go#9525, #9520 review R2-1): the manifest list, the
+	// manifests and the statistics paths come from metadata.json and the data-file
+	// paths from manifests, all of which the writer under suspicion can rewrite, so
+	// none of them may pick what a Remove reaches. A path outside is skipped and
+	// logged, never removed; with no loaded path there is no anchor and nothing is
+	// removed (a leak, not a wrong delete).
+	fsBase := io.PathBaseOf(prefs)
+	metaDir, anchored := loadedMetadataDir(fsBase, preTable.metadataLocation)
+	root := ""
+	if anchored {
+		if i := strings.LastIndexByte(metaDir, '/'); i > 0 {
+			root = metaDir[:i]
+		} else {
+			anchored = false
+		}
+	}
+	paths := make([]string, 0, len(filesToDelete))
+	for p := range filesToDelete {
+		resolved, ok := "", false
+		if anchored {
+			resolved, ok = metadataLogPathWithin(fsBase, root, p)
+		}
+		if !ok {
+			log.Printf("Warning: Refused to delete an expired snapshot's file outside the table root: %q (table root %q)", p, root)
+
+			continue
+		}
+		paths = append(paths, resolved)
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	sort.Strings(paths)
 
 	// Try bulk delete first; on failure fall through to per-file delete.
 	if bulk, ok := prefs.(io.BulkRemovableIO); ok {

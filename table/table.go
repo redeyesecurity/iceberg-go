@@ -83,6 +83,56 @@ type Table struct {
 	metadataLocation string
 	cat              CatalogIO
 	fsF              FSysF
+	manifestReadIO   ManifestReadIO
+}
+
+// ManifestReadIO wraps the FileIO the COMMIT PATH reads manifest lists and manifests
+// through: the snapshot producers (the parent's list and manifest files in fast
+// append, overwrite, merge append and rewrite manifests, the inherited set in
+// computeOwnManifests, the root manifest's inline parent entries, the rebuild on a
+// commit retry), the staging reads a transaction makes before it produces (AddFiles'
+// duplicate check, AddDataFiles, ReplaceDataFiles, ReplaceFiles, Delete and
+// Overwrite's classification, RewriteManifests' source selection), the conflict
+// validation of concurrent snapshots on a retry, and the expire-snapshots cleanup's
+// reads of the expired and surviving snapshots. The commit still writes, and deletes,
+// through the FileIO it was given. Not covered: Transaction.Scan and the Delete and
+// Overwrite partial rewrite (rewriteSingleFile), which open data files through the
+// same FileIO, compaction, orphan cleanup, snapshot offload and Table.AllManifests.
+//
+// A catalog that holds stored paths to a rule (the RedEye lake catalog: a manifest
+// list or manifest is under the table location, see caver-go#9457 and #9520)
+// installs its checked reader here with WithManifestReadIO, so a manifest list or
+// manifest rewritten in place after the last check is refused before the commit
+// decodes it. nil means the commit reads through its own FileIO. The wrapper:
+//
+//   - MUST forward io.PathBaser when the inner FileIO has one: Snapshot.Manifests
+//     takes the base relative paths resolve against from PathBaseOf(fio), and a
+//     wrapper without it decodes a relative-paths table's list with no base.
+//   - receives only the FileIO, not the table: anchor the rule on the location the
+//     caller loaded the metadata from (closed over when the hook is installed), not
+//     on a field of the metadata the writer under suspicion can rewrite.
+//   - sees every path the commit OPENS. A fast append does not open the parent's
+//     manifest files, it copies the list's records forward; a wrapper that wants to
+//     refuse a foreign entry inside an in-table list has to decode the list bytes it
+//     serves and check each entry itself.
+type ManifestReadIO func(fs icebergio.IO) icebergio.IO
+
+// WithManifestReadIO is t with f wrapping the commit path's manifest reads (the list
+// above). The returned table shares t's metadata, catalog and FileIO; transactions
+// opened on it carry f, and so do the tables Commit and Refresh hand back.
+func (t Table) WithManifestReadIO(f ManifestReadIO) *Table {
+	t.manifestReadIO = f
+
+	return &t
+}
+
+// manifestIO is fs wrapped by the table's ManifestReadIO, or fs itself.
+func (t Table) manifestIO(fs icebergio.IO) icebergio.IO {
+	if t.manifestReadIO != nil {
+		return t.manifestReadIO(fs)
+	}
+
+	return fs
 }
 
 func (t Table) Equals(other Table) bool {
@@ -148,6 +198,7 @@ func (t *Table) Refresh(ctx context.Context) error {
 
 	t.metadata = fresh.metadata
 	t.fsF = fresh.fsF
+	// The reader hook is this process's, not the catalog's: a refresh keeps it.
 	t.metadataLocation = fresh.metadataLocation
 
 	return nil
@@ -505,7 +556,7 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 			// level case-sensitivity is not yet threaded through the
 			// Commit path, and true is the scan default throughout the
 			// codebase.
-			cc, ccErr := newConflictContext(t.metadata, current, co.branch, fs, true)
+			cc, ccErr := newConflictContext(t.metadata, current, co.branch, t.manifestIO(fs), true) // the concurrent snapshots, read through the hook
 			if ccErr != nil {
 				// ErrCommitDiverged — terminal, do not retry. The
 				// sentinel deliberately does not wrap ErrCommitFailed.
@@ -551,7 +602,10 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 	// base the same way.
 	deleteOldMetadata(fs, current, currentLoc, newMeta)
 
-	return New(t.identifier, newMeta, newLoc, t.fsF, t.cat), nil
+	committed := New(t.identifier, newMeta, newLoc, t.fsF, t.cat)
+	committed.manifestReadIO = t.manifestReadIO // a caller that chains on the result keeps the hook
+
+	return committed, nil
 }
 
 // rewriteRefSnapshotRequirements returns a copy of reqs with every
