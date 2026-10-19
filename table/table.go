@@ -741,7 +741,19 @@ func deleteOldMetadata(fs icebergio.IO, baseMeta, newMeta Metadata) {
 		currentMetadata := slices.Collect(getFiles(newMeta.PreviousFiles()))
 		toRemove := internal.Difference(removedPrevious, currentMetadata)
 
-		for _, file := range toRemove {
+		// Every entry is held to <location>/metadata before it is removed
+		// (caver-go#9525): the log is read from metadata.json, and a planted
+		// entry must not reach any other object the FileIO can delete.
+		fsBase := icebergio.PathBaseOf(fs)
+		metaDir := metadataLogDir(fsBase, newMeta.Location())
+
+		for _, entry := range toRemove {
+			file, ok := metadataLogPathWithin(fsBase, metaDir, entry)
+			if !ok {
+				log.Printf("Warning: Refused to delete old metadata file outside the table metadata directory: %q (metadata directory %q)", entry, metaDir)
+
+				continue
+			}
 			if err := fs.Remove(file); err != nil {
 				// A file that is already gone is the outcome the delete wanted. A
 				// compactor may have removed it, or a peer writer whose commit the

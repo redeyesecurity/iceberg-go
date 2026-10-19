@@ -96,7 +96,12 @@ func (c *oneVersionLogCatalog) commit(updates []Update) (Metadata, string, error
 	}
 
 	c.version++
-	loc := filepath.ToSlash(filepath.Join(c.dir, fmt.Sprintf("v%d.metadata.json", c.version)))
+	// The files live in <location>/metadata, the only directory the cleanup
+	// will delete from (caver-go#9525).
+	if err := os.MkdirAll(filepath.Join(c.dir, "metadata"), 0o755); err != nil {
+		return nil, "", err
+	}
+	loc := filepath.ToSlash(filepath.Join(c.dir, "metadata", fmt.Sprintf("v%d.metadata.json", c.version)))
 	if err := os.WriteFile(loc, []byte("{}"), 0o644); err != nil {
 		return nil, "", err
 	}
