@@ -177,7 +177,9 @@ func TestRootManifestSweepAndRelativePaths(t *testing.T) {
 	}
 	// Sweep: roots and children are referenced; only the stray is an orphan.
 	require.NoError(t, os.WriteFile(dir+"/wh/t/metadata/stray.avro", []byte("x"), 0o644))
-	res, err := tbl.DeleteOrphanFiles(ctx, WithDryRun(true), WithFilesOlderThan(0), WithEqualSchemes(map[string]string{"file": ""}))
+	// sequentialCatalog returns no metadata path, so there is no loaded file to
+	// anchor the default root on (caver-go#9630): name the root.
+	res, err := tbl.DeleteOrphanFiles(ctx, WithLocation(tbl.Location()), WithDryRun(true), WithFilesOlderThan(0), WithEqualSchemes(map[string]string{"file": ""}))
 	require.NoError(t, err)
 	require.Len(t, res.OrphanFileLocations, 1, "%v", res.OrphanFileLocations)
 	require.Contains(t, res.OrphanFileLocations[0], "stray.avro")

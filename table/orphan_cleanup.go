@@ -155,6 +155,45 @@ func WithEqualAuthorities(authorities map[string]string) OrphanCleanupOption {
 	}
 }
 
+// ErrOrphanScanRefused is returned when DeleteOrphanFiles has no location to
+// scan that the loaded metadata file vouches for and the caller named none.
+var ErrOrphanScanRefused = errors.New("orphan scan root does not agree with the loaded metadata file")
+
+// orphanScanRoot picks the default orphan scan root (caver-go#9630).
+//
+// The scan used to start at the location field of the parsed metadata, and
+// that field is a string in metadata.json: one in-place plant that moved it to
+// another table's directory, with no commit at all, made orphan cleanup on the
+// planted table list the other table's head and data as orphans and delete
+// them. The root is now anchored the way the expire cleanup is (redeye.18,
+// caver-go#9525): the parent of the directory of the metadata file the table
+// was loaded from, the path the catalog pointer named, which the file's
+// contents cannot move. The parsed location must name that same directory; if
+// it does not, or there is no loaded path to anchor on, the scan is refused
+// with ErrOrphanScanRefused rather than guessed. A table that keeps its
+// metadata outside <location>/metadata (write.metadata.path) is refused the
+// same way: pass WithLocation to name the root explicitly.
+//
+// The parsed location is what gets scanned once it agrees, spelled as the
+// table spells it, so the walk and the referenced set normalise exactly as
+// they did before.
+func orphanScanRoot(fsBase, location, loadedLoc string) (string, error) {
+	metaDir, ok := loadedMetadataDir(fsBase, loadedLoc)
+	if !ok {
+		return "", fmt.Errorf("%w: no loaded metadata path to anchor on (%q), name the root with WithLocation", ErrOrphanScanRefused, loadedLoc)
+	}
+	i := strings.LastIndexByte(metaDir, '/')
+	if i <= 0 {
+		return "", fmt.Errorf("%w: loaded metadata directory %q has no parent", ErrOrphanScanRefused, metaDir)
+	}
+	root := metaDir[:i]
+	if location == "" || !sameStorageDir(root, iceio.JoinBase(fsBase, location)) {
+		return "", fmt.Errorf("%w: loaded from %q, the metadata names location %q", ErrOrphanScanRefused, metaDir, location)
+	}
+
+	return location, nil
+}
+
 type OrphanCleanupResult struct {
 	OrphanFileLocations []string
 	DeletedFiles        []string
@@ -189,7 +228,10 @@ func (t Table) executeOrphanCleanup(ctx context.Context, cfg *orphanCleanupConfi
 
 	scanLocation := cfg.location
 	if scanLocation == "" {
-		scanLocation = t.metadata.Location()
+		scanLocation, err = orphanScanRoot(iceio.PathBaseOf(fs), t.metadata.Location(), t.metadataLocation)
+		if err != nil {
+			return OrphanCleanupResult{}, err
+		}
 	}
 
 	referencedFiles, err := t.getReferencedFiles(fs)
