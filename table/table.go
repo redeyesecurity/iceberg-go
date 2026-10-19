@@ -115,6 +115,16 @@ type Table struct {
 //     manifest files, it copies the list's records forward; a wrapper that wants to
 //     refuse a foreign entry inside an in-table list has to decode the list bytes it
 //     serves and check each entry itself.
+//
+// The expire-snapshots cleanup holds every path it removes to the table root, taken
+// as the parent of the directory the metadata was loaded from (not the metadata's
+// location field), whether or not a ManifestReadIO is installed. A path outside that
+// root is skipped and logged, and a table loaded with no metadata path removes
+// nothing. So a table that writes data or metadata outside its root, through
+// write.data.path, write.metadata.path or an object-storage layout, leaks the
+// expired files there instead of deleting them: the safe direction, and caver-go
+// sets none of these. Whether a per-table allow-list of extra roots is wanted is
+// caver-go#9568.
 type ManifestReadIO func(fs icebergio.IO) icebergio.IO
 
 // WithManifestReadIO is t with f wrapping the commit path's manifest reads (the list

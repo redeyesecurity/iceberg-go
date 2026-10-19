@@ -500,3 +500,108 @@ func TestTheExpireCleanupRemovesOnlyUnderTheTableRoot(t *testing.T) {
 	require.False(t, exists(s1List), "the expired snapshot's own manifest list was not removed")
 	require.True(t, exists(inTable), "a data file the surviving snapshot still references was removed")
 }
+
+// The two doors the round-3 re-check found unpinned (R3-1): ReplaceFiles with delete
+// files to remove does not hand off to ReplaceDataFilesWithDataFiles and reads the
+// parent through its own scan, and Delete with a predicate other than AlwaysTrue
+// classifies through classifyFilesForFilteredDeletions, which opens the list and each
+// manifest itself. Each door reds when its site reads past the hook.
+func TestTheRoundThreeCommitDoorsReadThroughTheHook(t *testing.T) {
+	ctx := context.Background()
+	t.Run("ReplaceFiles with delete files to remove", func(t *testing.T) {
+		r := newCoverageRig(t, nil)
+		r.appendOne(t)
+		posDel := fmt.Sprintf("%s/pos-del-%d.parquet", r.tbl.Location(), r.n)
+		r.write(posDel) // the delete file's contents are never read on this path
+		bldr, err := iceberg.NewDataFileBuilder(*iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes,
+			posDel, iceberg.ParquetFile, nil, nil, nil, 1, 128)
+		require.NoError(t, err)
+		txn := r.tbl.NewTransaction()
+		require.NoError(t, txn.NewRowDelta(nil).AddDeletes(bldr.Build()).Commit(ctx))
+		landed, err := txn.Commit(ctx)
+		require.NoError(t, err)
+		r.tbl = landed
+		var oldData, oldDeletes []iceberg.DataFile
+		for _, df := range r.currentDataFiles(t) {
+			if df.ContentType() == iceberg.EntryContentData {
+				oldData = append(oldData, df)
+			} else {
+				oldDeletes = append(oldDeletes, df)
+			}
+		}
+		require.Len(t, oldDeletes, 1, "the row delta did not land a delete file, so ReplaceFiles would hand off")
+		add := r.dataFilesFor(t, r.next())
+		r.raw.take()
+		r.hook.take()
+		txn = r.tbl.NewTransaction()
+		require.NoError(t, txn.ReplaceFiles(ctx, oldData, add, oldDeletes, nil))
+		landed, err = txn.Commit(ctx)
+		require.NoError(t, err)
+		r.tbl = landed
+		requireEveryManifestOpenHooked(t, r, "ReplaceFiles with delete files")
+	})
+	t.Run("Delete with a real predicate", func(t *testing.T) {
+		r := newCoverageRig(t, nil)
+		r.appendOne(t)
+		r.raw.take()
+		r.hook.take()
+		txn := r.tbl.NewTransaction()
+		require.NoError(t, txn.Delete(ctx, iceberg.EqualTo(iceberg.Reference("id"), int32(1)), nil))
+		landed, err := txn.Commit(ctx)
+		require.NoError(t, err)
+		r.tbl = landed
+		requireEveryManifestOpenHooked(t, r, "Delete with a predicate")
+		require.Equal(t, "1", r.tbl.CurrentSnapshot().Summary.Properties["deleted-data-files"],
+			"the predicate classified nothing, so the filtered path proved nothing")
+	})
+}
+
+// The expire cleanup anchors on the path the metadata was LOADED from, not on the
+// metadata's location field (R3-2). The writer under suspicion moves location up to
+// the common parent of this table and a sibling-prefix table, and a manifest of this
+// table names that sibling's data file. Anchored on location, the sibling's file sits
+// under the root and is removed; anchored on the loaded path, it survives.
+func TestTheExpireCleanupAnchorsOnTheLoadedPathNotTheLocation(t *testing.T) {
+	ctx := context.Background()
+	r := newCoverageRig(t, nil)
+	loaded := r.tbl.MetadataLocation()
+	parent := r.tbl.Location()[:strings.LastIndexByte(r.tbl.Location(), '/')]
+	sibling := r.tbl.Location() + "-sibling/data.parquet" // shares the table's path as a string prefix
+	r.write(sibling)
+	txn := r.tbl.NewTransaction()
+	require.NoError(t, txn.AddFiles(ctx, []string{sibling}, nil, false)) // s1: the sibling's file in an in-table manifest
+	s1, err := txn.Commit(ctx)
+	require.NoError(t, err)
+	r.tbl = s1
+	s1List := s1.CurrentSnapshot().ManifestList
+	txn = r.tbl.NewTransaction()
+	require.NoError(t, txn.ReplaceDataFiles(ctx, []string{sibling}, []string{r.next()}, nil)) // s2 removes it
+	s2, err := txn.Commit(ctx)
+	require.NoError(t, err)
+	r.tbl = s2
+	txn = r.tbl.NewTransaction()
+	require.NoError(t, txn.AddFiles(ctx, []string{r.next()}, nil, false)) // s3, so s1 and s2 can go
+	s3, err := txn.Commit(ctx)
+	require.NoError(t, err)
+
+	// The rewrite: location now names the common parent, while the table is still the
+	// one loaded from its own metadata directory.
+	mb, err := MetadataBuilderFromBase(s3.Metadata(), s3.MetadataLocation())
+	require.NoError(t, err)
+	require.NoError(t, mb.SetLoc(parent))
+	moved, err := mb.Build()
+	require.NoError(t, err)
+	r.cat.meta = moved
+	r.tbl = New(s3.Identifier(), moved, loaded, r.cat.fsF, r.cat).
+		WithManifestReadIO(func(fs iceio.IO) iceio.IO { r.hook.inner = fs; return r.hook })
+	require.Equal(t, parent, r.tbl.Location())
+
+	time.Sleep(5 * time.Millisecond)
+	txn = r.tbl.NewTransaction()
+	require.NoError(t, txn.ExpireSnapshots(WithRetainLast(1), WithOlderThan(0), WithPostCommit(true)))
+	_, err = txn.Commit(ctx)
+	require.NoError(t, err)
+	exists := func(p string) bool { _, err := r.raw.Open(p); return err == nil }
+	require.False(t, exists(s1List), "the expired snapshot's own manifest list was not removed, so the cleanup never ran")
+	require.True(t, exists(sibling), "the expire cleanup anchored on the rewritten location and removed a sibling table's file")
+}
