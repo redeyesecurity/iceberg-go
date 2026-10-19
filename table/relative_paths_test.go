@@ -148,7 +148,9 @@ func TestRelativePathsWrittenRelativeReadAbsolute(t *testing.T) {
 	// The orphan sweep's referenced set resolves the relative paths, so nothing the
 	// table owns is an orphan and a real stray still is.
 	require.NoError(t, os.WriteFile(dir+"/wh/t/data/stray.parquet", []byte("x"), 0o644))
-	res, err := tbl.DeleteOrphanFiles(ctx, WithDryRun(true), WithFilesOlderThan(0), WithEqualSchemes(map[string]string{"file": ""}))
+	// sequentialCatalog returns no metadata path, so there is no loaded file to
+	// anchor the default root on (caver-go#9630): name the root.
+	res, err := tbl.DeleteOrphanFiles(ctx, WithLocation(tbl.Location()), WithDryRun(true), WithFilesOlderThan(0), WithEqualSchemes(map[string]string{"file": ""}))
 	require.NoError(t, err)
 	require.Len(t, res.OrphanFileLocations, 1, "only the stray may be an orphan: %v", res.OrphanFileLocations)
 	require.Contains(t, res.OrphanFileLocations[0], "stray.parquet")
