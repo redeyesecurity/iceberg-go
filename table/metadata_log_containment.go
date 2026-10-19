@@ -29,9 +29,16 @@ import (
 // entries are strings read from the base metadata.json. A writer who can
 // rewrite metadata.json in place can plant an entry naming any object the
 // FileIO reaches, and before this check the next ordinary commit by anyone
-// deleted it. Every entry is now held to the table's own metadata directory,
-// <location>/metadata, before it is removed; anything else is left in place
-// and logged.
+// deleted it. Each entry is now held to the directory of the metadata file the
+// writer loaded, the path the catalog's pointer named, before it is removed;
+// anything else is left in place and logged.
+//
+// The anchor is that loaded path, not the location field of the parsed
+// metadata. redeye.16 anchored on newMeta.Location(), and a catalog with
+// nothing cached returns the planted file's own location field, so a plant
+// that also moved location to another table's directory reached that
+// table's head (caver-go#9528 review, F1). The pointer path is not something
+// the file's contents can move.
 //
 // The check resolves an entry exactly the way the delete does: a relative
 // entry joins the FileIO's base (the warehouse under write.paths.relative),
@@ -39,13 +46,28 @@ import (
 // The resolved absolute path is what gets removed, so the string that was
 // checked is the string that is deleted.
 //
-// Tables that set write.metadata.path keep their metadata elsewhere; their
-// old files are refused and left behind. That fails safe (a leak, never a
-// wrong delete), and Caver never sets the property.
+// With no loaded path (a table built with an empty metadata location) there is
+// no anchor and each entry is refused. That fails safe: a leak, not a wrong
+// delete.
 
-// metadataLogDir returns the directory every metadata-log delete is held to.
-func metadataLogDir(fsBase, location string) string {
-	return strings.TrimRight(icebergio.JoinBase(fsBase, location), "/") + "/metadata"
+// loadedMetadataDir returns the directory of the metadata file the writer
+// loaded, resolved against the FileIO base, the only directory a
+// metadata-log delete may touch. It reports false when there is no usable
+// anchor.
+func loadedMetadataDir(fsBase, metadataLocation string) (string, bool) {
+	if metadataLocation == "" {
+		return "", false
+	}
+	resolved := icebergio.JoinBase(fsBase, metadataLocation)
+	if icebergio.IsRelativePath(resolved) {
+		return "", false
+	}
+	i := strings.LastIndexByte(resolved, '/')
+	if i <= 0 || i == len(resolved)-1 {
+		return "", false
+	}
+
+	return resolved[:i], true
 }
 
 // metadataLogPathWithin resolves entry against the FileIO base and reports

@@ -434,6 +434,10 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 	// walk is empty and validators short-circuit). On subsequent
 	// attempts it is the freshly-loaded post-conflict state.
 	current := t.metadata
+	// currentLoc is the metadata file current was loaded from, the path the
+	// catalog pointer named. The old-metadata cleanup is held to its directory
+	// (caver-go#9525), so it moves with current on a retry.
+	currentLoc := t.metadataLocation
 
 	// numRetries counts retries; total attempts = 1 initial + numRetries.
 	totalAttempts := cfg.numRetries + 1
@@ -466,6 +470,7 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 				return nil, fmt.Errorf("refresh table for retry: %w", refreshErr)
 			}
 			current = fresh.metadata
+			currentLoc = fresh.metadataLocation
 			reqs = rewriteRefSnapshotRequirements(reqs, co.branch, current)
 
 			// Rebuild snapshot manifest lists to inherit all files committed
@@ -544,7 +549,7 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 	// and deleted, so every writer that lost a race would delete them again
 	// (caver-go#9384). Java's BaseMetastoreTableOperations uses the refreshed
 	// base the same way.
-	deleteOldMetadata(fs, current, newMeta)
+	deleteOldMetadata(fs, current, currentLoc, newMeta)
 
 	return New(t.identifier, newMeta, newLoc, t.fsF, t.cat), nil
 }
@@ -732,7 +737,10 @@ func getFiles(it iter.Seq[MetadataLogEntry]) iter.Seq[string] {
 	}
 }
 
-func deleteOldMetadata(fs icebergio.IO, baseMeta, newMeta Metadata) {
+// deleteOldMetadata removes the metadata-log entries newMeta trimmed from
+// baseMeta. baseLoc is the metadata file baseMeta was loaded from; each entry
+// is held to its directory (caver-go#9525).
+func deleteOldMetadata(fs icebergio.IO, baseMeta Metadata, baseLoc string, newMeta Metadata) {
 	deleteAfterCommit := newMeta.Properties().GetBool(MetadataDeleteAfterCommitEnabledKey,
 		MetadataDeleteAfterCommitEnabledDefault)
 
@@ -741,14 +749,18 @@ func deleteOldMetadata(fs icebergio.IO, baseMeta, newMeta Metadata) {
 		currentMetadata := slices.Collect(getFiles(newMeta.PreviousFiles()))
 		toRemove := internal.Difference(removedPrevious, currentMetadata)
 
-		// Every entry is held to <location>/metadata before it is removed
-		// (caver-go#9525): the log is read from metadata.json, and a planted
-		// entry must not reach any other object the FileIO can delete.
+		// Each entry is held to the directory of the loaded metadata file
+		// before it is removed (caver-go#9525): the log is read from
+		// metadata.json, and so is the location field, so neither may pick
+		// the directory a delete reaches. The pointer path does.
 		fsBase := icebergio.PathBaseOf(fs)
-		metaDir := metadataLogDir(fsBase, newMeta.Location())
+		metaDir, anchored := loadedMetadataDir(fsBase, baseLoc)
 
 		for _, entry := range toRemove {
-			file, ok := metadataLogPathWithin(fsBase, metaDir, entry)
+			file, ok := "", false
+			if anchored {
+				file, ok = metadataLogPathWithin(fsBase, metaDir, entry)
+			}
 			if !ok {
 				log.Printf("Warning: Refused to delete old metadata file outside the table metadata directory: %q (metadata directory %q)", entry, metaDir)
 
