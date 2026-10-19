@@ -324,12 +324,16 @@ func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 		referenced[p] = true
 	}
 
+	// The lists and manifests are read through the table's ManifestReadIO, so a
+	// manifest rewritten in place to drop entries (which would make the dropped
+	// files read as orphans) is refused before it is decoded (caver-go#9638).
+	mfs := t.manifestIO(fs)
 	for _, snapshot := range metadata.Snapshots() {
 		if snapshot.ManifestList != "" {
 			referenced[iceio.JoinBase(iceio.PathBaseOf(fs), snapshot.ManifestList)] = true
 		}
 
-		manifestFiles, err := snapshot.Manifests(fs)
+		manifestFiles, err := snapshot.Manifests(mfs)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read manifests for snapshot %d: %w", snapshot.SnapshotID, err)
 		}
@@ -343,7 +347,7 @@ func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 			// against orphan cleanup once the snapshot that
 			// originally held it live has been expired.
 			// This matches iceberg-java and pyiceberg behavior.
-			for entry, err := range manifest.Entries(fs, true) {
+			for entry, err := range manifest.Entries(mfs, true) {
 				if err != nil {
 					return nil, fmt.Errorf("failed to read manifest entries: %w", err)
 				}

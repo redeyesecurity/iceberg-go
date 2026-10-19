@@ -93,11 +93,13 @@ type Table struct {
 // commit retry), the staging reads a transaction makes before it produces (AddFiles'
 // duplicate check, AddDataFiles, ReplaceDataFiles, ReplaceFiles, Delete and
 // Overwrite's classification, RewriteManifests' source selection), the conflict
-// validation of concurrent snapshots on a retry, and the expire-snapshots cleanup's
-// reads of the expired and surviving snapshots. The commit still writes, and deletes,
-// through the FileIO it was given. Not covered: Transaction.Scan and the Delete and
-// Overwrite partial rewrite (rewriteSingleFile), which open data files through the
-// same FileIO, compaction, orphan cleanup, snapshot offload and Table.AllManifests.
+// validation of concurrent snapshots on a retry, the expire-snapshots cleanup's
+// reads of the expired and surviving snapshots, and the orphan scan's reads of every
+// snapshot's list and manifests (caver-go#9638). The commit still writes, and
+// deletes, through the FileIO it was given. Not covered: Transaction.Scan and the
+// Delete and Overwrite partial rewrite (rewriteSingleFile), which open data files
+// through the same FileIO, compaction, the orphan scan's directory walk and snapshot
+// segment chain, snapshot offload and Table.AllManifests.
 //
 // A catalog that holds stored paths to a rule (the RedEye lake catalog: a manifest
 // list or manifest is under the table location, see caver-go#9457 and #9520)

@@ -614,3 +614,31 @@ func TestTheExpireCleanupAnchorsOnTheLoadedPathNotTheMovedLocation(t *testing.T)
 	require.False(t, exists(ownFile), "a file under the loaded table was not removed, so the cleanup ran nothing")
 	require.True(t, exists(keep), "a file the surviving snapshot references was removed")
 }
+
+// The orphan scan builds its referenced set from every snapshot's list and manifests
+// through the hook, and a list or manifest the hook refuses aborts the scan with
+// nothing deleted (caver-go#9638).
+func TestTheOrphanScanReadsManifestsThroughTheHook(t *testing.T) {
+	ctx := context.Background()
+	t.Run("every list and manifest open is hooked", func(t *testing.T) {
+		r := newCoverageRig(t, nil)
+		r.appendOne(t)
+		r.appendOne(t)
+		r.raw.take()
+		r.hook.take()
+		_, err := r.tbl.DeleteOrphanFiles(ctx, WithDryRun(true), WithFilesOlderThan(0))
+		require.NoError(t, err)
+		requireEveryManifestOpenHooked(t, r, "orphan scan")
+	})
+	t.Run("a refused manifest aborts the scan with nothing deleted", func(t *testing.T) {
+		r := newCoverageRig(t, nil)
+		r.appendOne(t)
+		r.appendOne(t)
+		r.hook.refuse = "-m0.avro"
+		var deleted []string
+		_, err := r.tbl.DeleteOrphanFiles(ctx, WithFilesOlderThan(0),
+			WithDeleteFunc(func(p string) error { deleted = append(deleted, p); return nil }))
+		require.ErrorIs(t, err, errHookRefused)
+		require.Empty(t, deleted, "a refused manifest read must delete nothing")
+	})
+}
