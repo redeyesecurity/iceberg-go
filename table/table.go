@@ -95,9 +95,9 @@ type Table struct {
 // Overwrite's classification, RewriteManifests' source selection), the conflict
 // validation of concurrent snapshots on a retry, and the expire-snapshots cleanup's
 // reads of the expired and surviving snapshots. The commit still writes, and deletes,
-// through the FileIO it was given. Not covered: Transaction.Scan (it opens data files
-// through the same FileIO), compaction, orphan cleanup, snapshot offload and
-// Table.AllManifests.
+// through the FileIO it was given. Not covered: Transaction.Scan and the Delete and
+// Overwrite partial rewrite (rewriteSingleFile), which open data files through the
+// same FileIO, compaction, orphan cleanup, snapshot offload and Table.AllManifests.
 //
 // A catalog that holds stored paths to a rule (the RedEye lake catalog: a manifest
 // list or manifest is under the table location, see caver-go#9457 and #9520)

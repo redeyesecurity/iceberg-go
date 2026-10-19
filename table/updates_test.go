@@ -59,8 +59,8 @@ func TestRemoveSnapshotsPostCommitDeletesStatisticsFiles(t *testing.T) {
 	  "snapshots": [{"snapshot-id":1,"timestamp-ms":1000,"sequence-number":1,"schema-id":0}],
 	  "snapshot-log": [],
 	  "metadata-log": [],
-	  "statistics": [{"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}],
-	  "partition-statistics": [{"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1-part.puffin","file-size-in-bytes":50}]
+	  "statistics": [{"snapshot-id":1,"statistics-path":"s3://bucket/table/stats/snap1.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}],
+	  "partition-statistics": [{"snapshot-id":1,"statistics-path":"s3://bucket/table/stats/snap1-part.puffin","file-size-in-bytes":50}]
 	}`
 	const postMeta = `{
 	  "format-version": 2,
@@ -87,20 +87,20 @@ func TestRemoveSnapshotsPostCommitDeletesStatisticsFiles(t *testing.T) {
 
 	// Pass *trackingIO to createTestTransaction — Go converts it to iceio.IO implicitly,
 	tio := newTrackingIO()
-	tio.files["s3://bucket/stats/snap1.puffin"] = []byte("puffin")
-	tio.files["s3://bucket/stats/snap1-part.puffin"] = []byte("puffin")
+	tio.files["s3://bucket/table/stats/snap1.puffin"] = []byte("puffin")
+	tio.files["s3://bucket/table/stats/snap1-part.puffin"] = []byte("puffin")
 
 	txn := createTestTransaction(t, tio, iceberg.NewPartitionSpec())
 	fsF := txn.tbl.fsF
-	preTable := New(Identifier{"ns", "tbl"}, pre, "metadata.json", fsF, nil)
-	postTable := New(Identifier{"ns", "tbl"}, post, "metadata.json", fsF, nil)
+	preTable := New(Identifier{"ns", "tbl"}, pre, "s3://bucket/table/metadata/v1.metadata.json", fsF, nil)
+	postTable := New(Identifier{"ns", "tbl"}, post, "s3://bucket/table/metadata/v1.metadata.json", fsF, nil)
 
 	update := NewRemoveSnapshotsUpdate([]int64{1}, true)
 	err = update.PostCommit(context.Background(), preTable, postTable)
 	require.NoError(t, err)
 
-	assert.NotContains(t, tio.files, "s3://bucket/stats/snap1.puffin")
-	assert.NotContains(t, tio.files, "s3://bucket/stats/snap1-part.puffin")
+	assert.NotContains(t, tio.files, "s3://bucket/table/stats/snap1.puffin")
+	assert.NotContains(t, tio.files, "s3://bucket/table/stats/snap1-part.puffin")
 }
 
 func TestRemoveSnapshotsPostCommitPreservesStatisticsOfSurvivingSnapshots(t *testing.T) {
@@ -129,12 +129,12 @@ func TestRemoveSnapshotsPostCommitPreservesStatisticsOfSurvivingSnapshots(t *tes
 	  "snapshot-log": [],
 	  "metadata-log": [],
 	  "statistics": [
-	    {"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]},
-	    {"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}
+	    {"snapshot-id":1,"statistics-path":"s3://bucket/table/stats/snap1.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]},
+	    {"snapshot-id":2,"statistics-path":"s3://bucket/table/stats/snap2.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}
 	  ],
 	  "partition-statistics": [
-	    {"snapshot-id":1,"statistics-path":"s3://bucket/stats/snap1-part.puffin","file-size-in-bytes":50},
-	    {"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2-part.puffin","file-size-in-bytes":50}
+	    {"snapshot-id":1,"statistics-path":"s3://bucket/table/stats/snap1-part.puffin","file-size-in-bytes":50},
+	    {"snapshot-id":2,"statistics-path":"s3://bucket/table/stats/snap2-part.puffin","file-size-in-bytes":50}
 	  ]
 	}`
 	const postMeta = `{
@@ -158,10 +158,10 @@ func TestRemoveSnapshotsPostCommitPreservesStatisticsOfSurvivingSnapshots(t *tes
 	  "snapshot-log": [],
 	  "metadata-log": [],
 	  "statistics": [
-	    {"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}
+	    {"snapshot-id":2,"statistics-path":"s3://bucket/table/stats/snap2.puffin","file-size-in-bytes":100,"file-footer-size-in-bytes":10,"blob-metadata":[]}
 	  ],
 	  "partition-statistics": [
-	    {"snapshot-id":2,"statistics-path":"s3://bucket/stats/snap2-part.puffin","file-size-in-bytes":50}
+	    {"snapshot-id":2,"statistics-path":"s3://bucket/table/stats/snap2-part.puffin","file-size-in-bytes":50}
 	  ]
 	}`
 
@@ -171,27 +171,27 @@ func TestRemoveSnapshotsPostCommitPreservesStatisticsOfSurvivingSnapshots(t *tes
 	require.NoError(t, err)
 
 	tio := newTrackingIO()
-	tio.files["s3://bucket/stats/snap1.puffin"] = []byte("puffin")
-	tio.files["s3://bucket/stats/snap1-part.puffin"] = []byte("puffin")
-	tio.files["s3://bucket/stats/snap2.puffin"] = []byte("puffin")
-	tio.files["s3://bucket/stats/snap2-part.puffin"] = []byte("puffin")
+	tio.files["s3://bucket/table/stats/snap1.puffin"] = []byte("puffin")
+	tio.files["s3://bucket/table/stats/snap1-part.puffin"] = []byte("puffin")
+	tio.files["s3://bucket/table/stats/snap2.puffin"] = []byte("puffin")
+	tio.files["s3://bucket/table/stats/snap2-part.puffin"] = []byte("puffin")
 
 	txn := createTestTransaction(t, tio, iceberg.NewPartitionSpec())
 	fsF := txn.tbl.fsF
-	preTable := New(Identifier{"ns", "tbl"}, pre, "metadata.json", fsF, nil)
-	postTable := New(Identifier{"ns", "tbl"}, post, "metadata.json", fsF, nil)
+	preTable := New(Identifier{"ns", "tbl"}, pre, "s3://bucket/table/metadata/v1.metadata.json", fsF, nil)
+	postTable := New(Identifier{"ns", "tbl"}, post, "s3://bucket/table/metadata/v1.metadata.json", fsF, nil)
 
 	update := NewRemoveSnapshotsUpdate([]int64{1}, true)
 	err = update.PostCommit(context.Background(), preTable, postTable)
 	require.NoError(t, err)
 
 	// snap1's statistics must be deleted
-	assert.NotContains(t, tio.files, "s3://bucket/stats/snap1.puffin")
-	assert.NotContains(t, tio.files, "s3://bucket/stats/snap1-part.puffin")
+	assert.NotContains(t, tio.files, "s3://bucket/table/stats/snap1.puffin")
+	assert.NotContains(t, tio.files, "s3://bucket/table/stats/snap1-part.puffin")
 
 	// snap2's statistics must survive
-	assert.Contains(t, tio.files, "s3://bucket/stats/snap2.puffin")
-	assert.Contains(t, tio.files, "s3://bucket/stats/snap2-part.puffin")
+	assert.Contains(t, tio.files, "s3://bucket/table/stats/snap2.puffin")
+	assert.Contains(t, tio.files, "s3://bucket/table/stats/snap2-part.puffin")
 }
 
 func TestUnmarshalUpdates(t *testing.T) {
