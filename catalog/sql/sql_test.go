@@ -525,6 +525,22 @@ func (s *SqliteCatalogTestSuite) TestCreateTableWithGivenLocation() {
 	}
 }
 
+func (s *SqliteCatalogTestSuite) TestCreateTableOnAnotherTablesLocationIsRefused() {
+	for _, cat := range []*sqlcat.Catalog{s.getCatalogMemory(), s.getCatalogSqlite()} {
+		first := s.randomTableIdentifier()
+		second := table.Identifier{catalog.NamespaceFromIdent(first)[0], "second_" + catalog.TableNameFromIdent(first)}
+		s.Require().NoError(cat.CreateNamespace(context.Background(), catalog.NamespaceFromIdent(first), nil))
+
+		tbl, err := cat.CreateTable(context.Background(), first, tableSchemaNested)
+		s.Require().NoError(err)
+
+		_, err = cat.CreateTable(context.Background(), second, tableSchemaNested,
+			catalog.WithLocation(tbl.Location()))
+		s.ErrorIs(err, catalog.ErrTableAlreadyExists)
+		s.NoError(cat.DropTable(context.Background(), first))
+	}
+}
+
 func (s *SqliteCatalogTestSuite) TestCreateTableWithoutNamespace() {
 	catalogs := []*sqlcat.Catalog{s.getCatalogMemory(), s.getCatalogSqlite()}
 	tblName := table.Identifier{tableName()}

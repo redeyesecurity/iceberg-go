@@ -264,6 +264,33 @@ func (c *Catalog) namespaceExists(ctx context.Context, ns string) (bool, error) 
 	})
 }
 
+// checkMetadataDirFree refuses a create whose first metadata file would sit
+// in the directory of a metadata file this catalog already points at.
+func (c *Catalog) checkMetadataDirFree(ctx context.Context, newMetadataLoc string) error {
+	i := strings.LastIndexByte(newMetadataLoc, '/')
+	if i < 0 {
+		return nil
+	}
+	prefix := likeEscaper.Replace(newMetadataLoc[:i+1]) + "%"
+
+	taken, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (bool, error) {
+		return tx.NewSelect().Model((*sqlIcebergTable)(nil)).
+			Where("catalog_name = ?", c.name).
+			Where("metadata_location LIKE ? ESCAPE '\\'", prefix).
+			Limit(1).Exists(ctx)
+	})
+	if err != nil {
+		return err
+	}
+	if taken {
+		return fmt.Errorf("%w: the location of %q already holds a table", catalog.ErrTableAlreadyExists, newMetadataLoc)
+	}
+
+	return nil
+}
+
+var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
 func checkValidNamespace(ident table.Identifier) error {
 	if len(ident) < 1 {
 		return fmt.Errorf("%w: empty namespace identifier", catalog.ErrNoSuchNamespace)
@@ -297,6 +324,12 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 	wfs, ok := afs.(io.WriteFileIO)
 	if !ok {
 		return nil, errors.New("loaded filesystem IO does not support writing")
+	}
+
+	// A location that already holds a table would put this table's first
+	// metadata file into that table's metadata directory (caver-go#9633).
+	if err := c.checkMetadataDirFree(ctx, staged.MetadataLocation()); err != nil {
+		return nil, err
 	}
 
 	compression := staged.Table.Properties().Get(table.MetadataCompressionKey, table.MetadataCompressionDefault)

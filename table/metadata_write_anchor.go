@@ -42,6 +42,14 @@ import (
 // anything. A commit that itself changes the location or write.metadata.path
 // still moves its metadata: that is an update the caller sent, not one read
 // from storage, and the catalog in front of it screens what it accepts.
+//
+// The same hold covers the data files (caver-go#9633). A plant that moves
+// location AND sets write.metadata.path to the loaded directory passes the
+// metadata check above, yet the writer places new data files from location
+// (or write.data.path), so they landed under the victim's data directory. The
+// loaded root is the parent of the loaded metadata directory, the layout every
+// catalog here writes (<root>/metadata/<file>), and the base must place its
+// data files strictly inside it.
 
 // ErrMetadataWriteRefused is returned when a commit would write its new
 // metadata file outside the directory of the metadata file it loaded.
@@ -72,6 +80,12 @@ func CheckMetadataWriteAnchor(fsBase string, base Metadata, loadedLoc string) er
 	nextDir, ok := loadedMetadataDir(fsBase, next)
 	if !ok || !sameStorageDir(loadedDir, nextDir) {
 		return fmt.Errorf("%w: loaded from %q, the base places the next file in %q", ErrMetadataWriteRefused, loadedDir, nextDir)
+	}
+
+	root := loadedDir[:strings.LastIndexByte(loadedDir, '/')+1]
+	dataLoc := provider.NewDataLocation("anchor-probe.parquet")
+	if _, ok := metadataLogPathWithin(fsBase, root, dataLoc); !ok {
+		return fmt.Errorf("%w: loaded from %q, the base places data files at %q outside %q", ErrMetadataWriteRefused, loadedDir, dataLoc, root)
 	}
 
 	return nil
