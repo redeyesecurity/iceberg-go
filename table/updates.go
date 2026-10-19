@@ -576,7 +576,9 @@ func (u *removeSnapshotsUpdate) PostCommit(ctx context.Context, preTable *Table,
 	// paths from manifests, all of which the writer under suspicion can rewrite, so
 	// none of them may pick what a Remove reaches. A path outside is skipped and
 	// logged, never removed; with no loaded path there is no anchor and nothing is
-	// removed (a leak, not a wrong delete).
+	// removed (a leak, not a wrong delete). Files placed outside the root by
+	// write.data.path, write.metadata.path or an object-storage layout leak the
+	// same way; see the ManifestReadIO doc (caver-go#9566).
 	fsBase := io.PathBaseOf(prefs)
 	metaDir, anchored := loadedMetadataDir(fsBase, preTable.metadataLocation)
 	root := ""

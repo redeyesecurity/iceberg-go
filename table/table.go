@@ -115,6 +115,20 @@ type Table struct {
 //     manifest files, it copies the list's records forward; a wrapper that wants to
 //     refuse a foreign entry inside an in-table list has to decode the list bytes it
 //     serves and check each entry itself.
+//
+// The expire-snapshots cleanup holds every path it removes to the table root, for
+// every caller, hook or not: the root is the parent of the directory the loaded
+// metadata file is in, and with no loaded path nothing is removed. A table whose
+// files are placed elsewhere therefore keeps its expired files rather than losing
+// them: data under write.data.path or an object-storage layout outside that root,
+// and, when write.metadata.path moves the metadata outside the table location, the
+// expired files under the location too, since the root is then the parent of the
+// moved metadata directory. Each skipped path is logged. That is the safe direction
+// (a leak, not a wrong delete), and an orphan scan finds what is left (caver-go's
+// lake.orphans). There is no option for an extra root: the RedEye lake catalog sets
+// none of these properties and refuses a commit that points one outside the table
+// location (caver-go#9428), so a second root would only ever widen what a Remove can
+// reach (caver-go#9566).
 type ManifestReadIO func(fs icebergio.IO) icebergio.IO
 
 // WithManifestReadIO is t with f wrapping the commit path's manifest reads (the list
