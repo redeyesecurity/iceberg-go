@@ -219,6 +219,21 @@ func UpdateAndStageTable(ctx context.Context, current *table.Table, ident table.
 
 		baseMeta = current.Metadata()
 		metadataLoc = current.MetadataLocation()
+
+		// The new metadata file is placed from the base's location, so the
+		// base must place it in the directory it was loaded from
+		// (caver-go#9536).
+		var fsBase string
+		if current.FSFunc() != nil {
+			fs, err := current.FS(ctx)
+			if err != nil {
+				return nil, err
+			}
+			fsBase = icebergio.PathBaseOf(fs)
+		}
+		if err := table.CheckMetadataWriteAnchor(fsBase, baseMeta, metadataLoc); err != nil {
+			return nil, err
+		}
 	} else {
 		var err error
 		baseMeta, err = table.NewMetadata(iceberg.NewSchema(0), nil, table.UnsortedSortOrder, "", nil)

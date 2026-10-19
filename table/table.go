@@ -587,6 +587,13 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 			return nil, context.Cause(retryCtx)
 		}
 
+		// The base must place its next metadata file in the directory it
+		// was loaded from (caver-go#9536). Checked on every attempt, since a
+		// retry commits on the base it refreshed to; terminal, not retried.
+		if anchorErr := CheckMetadataWriteAnchor(icebergio.PathBaseOf(fs), current, currentLoc); anchorErr != nil {
+			return nil, anchorErr
+		}
+
 		newMeta, newLoc, err = t.cat.CommitTable(retryCtx, t.identifier, reqs, updates)
 		if err == nil {
 			break
