@@ -33,11 +33,13 @@ import (
 
 // placingCatalog places each new metadata file the way a catalog built on
 // UpdateAndStageTable does, through the location provider of the committed
-// metadata, so the location field picks the directory. Its log keeps one
-// entry, the file the commit replaced, so every commit trims the previous
-// log and deleteOldMetadata sees it. onFail, when set, runs on each of the
-// first failFirst attempts before they are refused as a lost race.
+// metadata, so the location field picks the directory. Each commit trims the
+// log to its last keep entries and appends the file it replaced, the way
+// write.metadata.previous-versions-max=keep+1 would, and deleteOldMetadata
+// sees what was trimmed. onFail, when set, runs on each of the first
+// failFirst attempts before they are refused as a lost race.
 type placingCatalog struct {
+	keep      int
 	metadata  Metadata
 	location  string
 	version   int
@@ -66,7 +68,7 @@ func (c *placingCatalog) CommitTable(_ context.Context, _ Identifier, _ []Requir
 	if err != nil {
 		return nil, "", err
 	}
-	bldr.TrimMetadataLogs(0)
+	bldr.TrimMetadataLogs(c.keep)
 	bldr.AppendMetadataLog(MetadataLogEntry{MetadataFile: c.location, TimestampMs: time.Now().UnixMilli()})
 	for _, u := range updates {
 		if err := u.Apply(bldr); err != nil {
@@ -175,16 +177,18 @@ func listDir(t *testing.T, dir string) []string {
 }
 
 // The caver-go#9536 two-commit bypass of the redeye.17 delete anchor. A plant
-// in T's head moves location to V's directory and names V's head in the log.
-// Commit 1 used to place T's next head in <wh>/hot/metadata, where the
-// location provider read it from, and the pointer followed. Commit 2 was then
-// loaded from <wh>/hot/metadata, so its delete anchor was V's directory, and
-// it deleted V's head as a trimmed log entry. Commit 1 is now refused before
+// in T's head moves location to V's directory and names V's head in the log,
+// on a table that keeps two log entries. Commit 1 used to place T's next head
+// in <wh>/hot/metadata, where the location provider read it from, and the
+// pointer followed; the planted entry was carried, not trimmed. Commit 2 was
+// then loaded from <wh>/hot/metadata, so its delete anchor was V's directory,
+// and it trimmed and deleted V's head. Commit 1 is now refused before
 // the catalog sees it, nothing is written into V's directory, the pointer
 // stays on T, and every later commit on the planted base is refused the same
 // way.
 func TestALocationMovingPlantCannotWriteIntoAnotherTable9536(t *testing.T) {
 	f := newAnchorFixture(t, nil)
+	f.cat.keep = 1
 	head := f.cat.location
 	f.plantInPlace(t, f.wh+"/hot", f.victimHead)
 
