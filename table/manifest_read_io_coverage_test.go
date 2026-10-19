@@ -501,12 +501,18 @@ func TestTheExpireCleanupRemovesOnlyUnderTheTableRoot(t *testing.T) {
 	require.True(t, exists(inTable), "a data file the surviving snapshot still references was removed")
 }
 
-// The expire cleanup anchors on the metadata path the writer loaded, not on the
-// parsed location field (caver-go#9565, iceberg-go#17 round 3 R3-2). The planted
-// table's location is moved to the common parent while the loaded path stays under
-// the table, and a manifest names a sibling table's file: that file must survive,
-// and a file under the loaded table still goes. Anchoring on Metadata().Location()
-// would remove the sibling's file and fail this test.
+// R3-2 of the iceberg-go#17 round 3 re-check (caver-go#9565): the expire cleanup
+// anchors its removes on the metadata path the table was LOADED from, not on the
+// metadata's parsed location field. The three snapshots are committed honestly, so
+// the loaded path stays under the table; then the cleanup is run directly, as
+// doCommit would run it, on a pre-table whose location field has been moved to the
+// common parent. A manifest names a sibling table's file under that parent: it must
+// survive, a file under the loaded table still goes, and the surviving snapshot's
+// file stays. Anchoring on Metadata().Location() removes the sibling's file and
+// fails this test. (Committing AFTER moving the field would place the next metadata
+// file under the moved location and drag the loaded path with it, which is the gap
+// caver-go#9536 closes separately; the cleanup is probed on its own here so the
+// anchor is what is measured.)
 func TestTheExpireCleanupAnchorsOnTheLoadedPathNotTheMovedLocation(t *testing.T) {
 	ctx := context.Background()
 	r := newCoverageRig(t, nil)
@@ -516,15 +522,6 @@ func TestTheExpireCleanupAnchorsOnTheLoadedPathNotTheMovedLocation(t *testing.T)
 	ownFile := tableDir + "/data/own-old.parquet"
 	r.write(siblingFile)
 	r.write(ownFile)
-
-	schema := iceberg.NewSchema(1, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true})
-	moved, err := NewMetadata(schema, iceberg.UnpartitionedSpec, UnsortedSortOrder, parent, iceberg.Properties{PropertyFormatVersion: "2"})
-	require.NoError(t, err)
-	require.Equal(t, parent, strings.TrimSuffix(moved.Location(), "/"))
-	r.cat.meta = moved
-	loaded := tableDir + "/metadata/00000.json"
-	r.tbl = New(Identifier{"default", "cov"}, moved, loaded, r.tbl.fsF, r.cat).
-		WithManifestReadIO(func(fs iceio.IO) iceio.IO { r.hook.inner = fs; return r.hook })
 
 	txn := r.tbl.NewTransaction()
 	require.NoError(t, txn.AddFiles(ctx, []string{siblingFile, ownFile}, nil, false)) // s1: a sibling's file next to the table's own
@@ -542,11 +539,31 @@ func TestTheExpireCleanupAnchorsOnTheLoadedPathNotTheMovedLocation(t *testing.T)
 	s3, err := txn.Commit(ctx)
 	require.NoError(t, err)
 	r.tbl = s3
+	require.Equal(t, tableDir+"/metadata", s3.metadataLocation[:strings.LastIndexByte(s3.metadataLocation, '/')], "premise: the loaded path is under the table")
 	time.Sleep(5 * time.Millisecond)
+
+	// The expire in metadata only: post is the table after s1 and s2 are gone from
+	// the log, with nothing removed from storage yet.
 	txn = r.tbl.NewTransaction()
-	require.NoError(t, txn.ExpireSnapshots(WithRetainLast(1), WithOlderThan(0), WithPostCommit(true)))
-	_, err = txn.Commit(ctx)
+	require.NoError(t, txn.ExpireSnapshots(WithRetainLast(1), WithOlderThan(0), WithPostCommit(false)))
+	post, err := txn.Commit(ctx)
 	require.NoError(t, err)
+	require.Nil(t, post.Metadata().SnapshotByID(s1.CurrentSnapshot().SnapshotID), "premise: s1 expired")
+	require.Nil(t, post.Metadata().SnapshotByID(s2.CurrentSnapshot().SnapshotID), "premise: s2 expired")
+
+	// pre: s3's metadata with its location field moved to the common parent, still
+	// loaded from the path under the table.
+	bldr, err := MetadataBuilderFromBase(s3.Metadata(), "")
+	require.NoError(t, err)
+	require.NoError(t, bldr.SetLoc(parent))
+	movedMeta, err := bldr.Build()
+	require.NoError(t, err)
+	require.Equal(t, parent, strings.TrimSuffix(movedMeta.Location(), "/"))
+	pre := New(Identifier{"default", "cov"}, movedMeta, s3.metadataLocation, r.tbl.fsF, r.cat).
+		WithManifestReadIO(func(fs iceio.IO) iceio.IO { r.hook.inner = fs; return r.hook })
+
+	upd := NewRemoveSnapshotsUpdate([]int64{s1.CurrentSnapshot().SnapshotID, s2.CurrentSnapshot().SnapshotID}, true)
+	require.NoError(t, upd.PostCommit(ctx, pre, post))
 
 	exists := func(p string) bool { _, err := r.raw.Open(p); return err == nil }
 	require.True(t, exists(siblingFile), "the expire cleanup followed a moved location field and removed a sibling table's file")
