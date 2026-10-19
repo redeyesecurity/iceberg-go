@@ -432,6 +432,50 @@ func TestTheRemainingCommitDoorsReadThroughTheHook(t *testing.T) {
 		r.tbl = landed
 		requireEveryManifestOpenHooked(t, r, "Delete")
 	})
+	t.Run("ReplaceFiles with delete files to remove", func(t *testing.T) {
+		r := newCoverageRig(t, nil)
+		r.appendOne(t)
+		posDel, err := iceberg.NewDataFileBuilder(*iceberg.UnpartitionedSpec, iceberg.EntryContentPosDeletes,
+			r.tbl.Location()+"/pos-del-1.parquet", iceberg.ParquetFile, nil, nil, nil, 1, 128)
+		require.NoError(t, err)
+		deleteFile := posDel.Build()
+		rdTxn := r.tbl.NewTransaction()
+		require.NoError(t, rdTxn.NewRowDelta(nil).AddDeletes(deleteFile).Commit(ctx))
+		landed, err := rdTxn.Commit(ctx)
+		require.NoError(t, err)
+		r.tbl = landed
+		var old []iceberg.DataFile
+		for _, df := range r.currentDataFiles(t) {
+			if df.ContentType() == iceberg.EntryContentData {
+				old = append(old, df)
+			}
+		}
+		add := r.dataFilesFor(t, r.next())
+		r.raw.take()
+		r.hook.take()
+		// A non-empty deleteFilesToRemove skips the delegation to
+		// ReplaceDataFilesWithDataFiles and scans the snapshot at its own site.
+		txn := r.tbl.NewTransaction()
+		require.NoError(t, txn.ReplaceFiles(ctx, old, add, []iceberg.DataFile{deleteFile}, nil))
+		landed, err = txn.Commit(ctx)
+		require.NoError(t, err)
+		r.tbl = landed
+		requireEveryManifestOpenHooked(t, r, "ReplaceFiles with delete files")
+	})
+	t.Run("Delete with a real predicate", func(t *testing.T) {
+		r := newCoverageRig(t, nil)
+		r.appendOne(t)
+		r.raw.take()
+		r.hook.take()
+		// AlwaysTrue short-circuits to a plain scan; a real predicate reaches the
+		// filtered classification, which lists the manifests and opens each one.
+		txn := r.tbl.NewTransaction()
+		require.NoError(t, txn.Delete(ctx, iceberg.GreaterThanEqual(iceberg.Reference("id"), int32(0)), nil))
+		landed, err := txn.Commit(ctx)
+		require.NoError(t, err)
+		r.tbl = landed
+		requireEveryManifestOpenHooked(t, r, "filtered Delete")
+	})
 	t.Run("the rebuild on a real retry: the parent moved under the commit", func(t *testing.T) {
 		r := newStrictRig(t, iceberg.Properties{CommitNumRetriesKey: "4", CommitMinRetryWaitMsKey: "1", CommitMaxRetryWaitMsKey: "2"})
 		r.appendOne(t)
