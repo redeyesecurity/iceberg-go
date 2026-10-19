@@ -110,6 +110,25 @@ func (f containmentFixture) commitOnce(t *testing.T, fsys iceio.IO) string {
 	return logBuf.String()
 }
 
+// cleanupOnce runs the old-metadata cleanup for a commit that trimmed the
+// whole log of the catalog's current metadata, without going through
+// doCommit, and returns the log.
+func (f containmentFixture) cleanupOnce(t *testing.T, fsys iceio.IO) string {
+	t.Helper()
+	bldr, err := MetadataBuilderFromBase(f.cat.metadata, "")
+	require.NoError(t, err)
+	bldr.TrimMetadataLogs(0)
+	newMeta, err := bldr.Build()
+	require.NoError(t, err)
+
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+	deleteOldMetadata(fsys, f.cat.metadata, f.cat.location, newMeta)
+
+	return logBuf.String()
+}
+
 // The reviewer's probe (caver-go#9525): a metadata-log entry planted into
 // metadata.json naming an object outside the table was deleted by the next
 // ordinary commit. Every planted shape must survive the commit, the legitimate
@@ -178,6 +197,10 @@ func TestDeleteOldMetadataResolvesRelativeEntriesAgainstTheFileIOBase9525(t *tes
 // head was deleted. The anchor is now the directory of the metadata file the
 // writer loaded, so nothing outside <loc>/metadata is removed, and the
 // table's own old file there still is.
+//
+// Since caver-go#9536 doCommit refuses a commit on such a base before the
+// catalog sees it (metadata_write_anchor_test.go), so the cleanup is driven
+// directly here: it stays a second, independent hold.
 func TestALocationMovingPlantDeletesNothingOutsideTheLoadedDirectory9528(t *testing.T) {
 	for _, tc := range []struct{ name, moveTo string }{
 		{"another table", "/hot"},
@@ -195,7 +218,7 @@ func TestALocationMovingPlantDeletesNothingOutsideTheLoadedDirectory9528(t *test
 			f.plant(t, victimHead, rootMeta, legit)
 
 			fsys := &removeRecordingIO{}
-			out := f.commitOnce(t, fsys)
+			out := f.cleanupOnce(t, fsys)
 
 			assert.FileExists(t, victimHead, "the other table's head survives a location-moving plant")
 			assert.FileExists(t, rootMeta, "the warehouse root's metadata survives a location-moving plant")
