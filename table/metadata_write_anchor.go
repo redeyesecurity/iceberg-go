@@ -18,6 +18,7 @@
 package table
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -46,6 +47,18 @@ import (
 // ErrMetadataWriteRefused is returned when a commit would write its new
 // metadata file outside the directory of the metadata file it loaded.
 var ErrMetadataWriteRefused = errors.New("new metadata would be written outside the loaded metadata file's directory")
+
+// CommitRefusalObserver is an optional interface for a CatalogIO that keeps
+// count of the commits it refuses (caver-go#9632). doCommit refuses a commit
+// with ErrMetadataWriteRefused on the catalog's behalf, before CommitTable
+// runs, so a catalog that counts its own refusals never sees this one. A
+// catalog that implements the interface is told of each such refusal, once,
+// with the identifier and the error doCommit returns, before the caller gets
+// it. The call only observes: the commit is refused whatever it does, and it
+// must not block.
+type CommitRefusalObserver interface {
+	ObserveCommitRefusal(ctx context.Context, ident Identifier, err error)
+}
 
 // CheckMetadataWriteAnchor reports whether base, loaded from loadedLoc, places
 // its next metadata file in loadedLoc's directory. fsBase is the FileIO base
