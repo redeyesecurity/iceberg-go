@@ -23,6 +23,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,7 +55,24 @@ func newContainmentFixture(t *testing.T) containmentFixture {
 	})
 	require.NoError(t, err)
 
-	return containmentFixture{wh: wh, loc: loc, cat: &oneVersionLogCatalog{dir: loc, metadata: meta}}
+	// The catalog pointer names a file in <loc>/metadata, the directory the
+	// cleanup is anchored on.
+	head := loc + "/metadata/current.metadata.json"
+	require.NoError(t, os.WriteFile(head, []byte("{}"), 0o644))
+
+	return containmentFixture{wh: wh, loc: loc, cat: &oneVersionLogCatalog{dir: loc, metadata: meta, location: head}}
+}
+
+// moveLocation rewrites the catalog's current metadata so its location field
+// names newLoc, the other half of a plant that wants a wider delete scope.
+func (f containmentFixture) moveLocation(t *testing.T, newLoc string) {
+	t.Helper()
+	bldr, err := MetadataBuilderFromBase(f.cat.metadata, "")
+	require.NoError(t, err)
+	require.NoError(t, bldr.SetLoc(newLoc))
+	meta, err := bldr.Build()
+	require.NoError(t, err)
+	f.cat.metadata = meta
 }
 
 // plant rewrites the catalog's current metadata so its log names entries, the
@@ -153,6 +171,82 @@ func TestDeleteOldMetadataResolvesRelativeEntriesAgainstTheFileIOBase9525(t *tes
 	assert.Contains(t, out, `"events_warm/canary-rel-9525.json"`)
 }
 
+// The caver-go#9528 review probe (F1): a plant that moves the location field
+// to another table's directory, or to the warehouse root, and names that
+// table's head in the log. redeye.16 anchored on newMeta.Location(), which a
+// catalog with nothing cached returns from the planted file, and the victim's
+// head was deleted. The anchor is now the directory of the metadata file the
+// writer loaded, so nothing outside <loc>/metadata is removed, and the
+// table's own old file there still is.
+func TestALocationMovingPlantDeletesNothingOutsideTheLoadedDirectory9528(t *testing.T) {
+	for _, tc := range []struct{ name, moveTo string }{
+		{"another table", "/hot"},
+		{"warehouse root", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newContainmentFixture(t)
+			victimHead := f.wh + "/hot/metadata/00001-victim.metadata.json"
+			rootMeta := f.wh + "/metadata/00001-root.metadata.json"
+			legit := f.loc + "/metadata/v0.metadata.json"
+			for _, p := range []string{victimHead, rootMeta, legit} {
+				touch(t, p)
+			}
+			f.moveLocation(t, f.wh+tc.moveTo)
+			f.plant(t, victimHead, rootMeta, legit)
+
+			fsys := &removeRecordingIO{}
+			out := f.commitOnce(t, fsys)
+
+			assert.FileExists(t, victimHead, "the other table's head survives a location-moving plant")
+			assert.FileExists(t, rootMeta, "the warehouse root's metadata survives a location-moving plant")
+			assert.Equal(t, []string{legit}, fsys.removed, "only the entry in the loaded file's directory reaches Remove")
+			assert.NoFileExists(t, legit)
+			for _, p := range []string{victimHead, rootMeta} {
+				assert.Contains(t, out, "Refused to delete old metadata file outside the table metadata directory: \""+p+"\"")
+			}
+			assert.Contains(t, out, `(metadata directory "`+f.loc+`/metadata")`)
+		})
+	}
+}
+
+// With no loaded metadata path there is no anchor, and each entry is refused.
+func TestNoLoadedMetadataPathRefusesEachEntry9528(t *testing.T) {
+	f := newContainmentFixture(t)
+	legit := f.loc + "/metadata/v0.metadata.json"
+	touch(t, legit)
+	f.plant(t, legit)
+	f.cat.location = ""
+
+	fsys := &removeRecordingIO{}
+	out := f.commitOnce(t, fsys)
+
+	assert.Empty(t, fsys.removed)
+	assert.FileExists(t, legit)
+	assert.Contains(t, out, "Refused to delete old metadata file outside the table metadata directory: \""+legit+"\"")
+}
+
+func TestLoadedMetadataDir9528(t *testing.T) {
+	cases := []struct {
+		name, base, loc, want string
+		ok                    bool
+	}{
+		{"local", "", "/w/t/metadata/v1.metadata.json", "/w/t/metadata", true},
+		{"s3", "", "s3://lake/w/t/metadata/v1.metadata.json", "s3://lake/w/t/metadata", true},
+		{"relative against base", "/w", "t/metadata/v1.metadata.json", "/w/t/metadata", true},
+		{"relative with no base", "", "t/metadata/v1.metadata.json", "", false},
+		{"empty", "", "", "", false},
+		{"trailing slash", "", "/w/t/metadata/", "", false},
+		{"no slash", "", "v1.metadata.json", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := loadedMetadataDir(tc.base, tc.loc)
+			assert.Equal(t, tc.ok, ok)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
 func TestMetadataLogPathWithin9525(t *testing.T) {
 	cases := []struct {
 		name, base, loc, entry string
@@ -197,7 +291,9 @@ func TestMetadataLogPathWithin9525(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := metadataLogPathWithin(tc.base, metadataLogDir(tc.base, tc.loc), tc.entry)
+			dir, anchored := loadedMetadataDir(tc.base, strings.TrimRight(tc.loc, "/")+"/metadata/v9.metadata.json")
+			require.True(t, anchored)
+			got, ok := metadataLogPathWithin(tc.base, dir, tc.entry)
 			assert.Equal(t, tc.want, ok, "entry %q", tc.entry)
 			if ok {
 				assert.Equal(t, iceio.JoinBase(tc.base, tc.entry), got)
