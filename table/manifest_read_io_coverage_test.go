@@ -500,3 +500,56 @@ func TestTheExpireCleanupRemovesOnlyUnderTheTableRoot(t *testing.T) {
 	require.False(t, exists(s1List), "the expired snapshot's own manifest list was not removed")
 	require.True(t, exists(inTable), "a data file the surviving snapshot still references was removed")
 }
+
+// The expire cleanup anchors on the metadata path the writer loaded, not on the
+// parsed location field (caver-go#9565, iceberg-go#17 round 3 R3-2). The planted
+// table's location is moved to the common parent while the loaded path stays under
+// the table, and a manifest names a sibling table's file: that file must survive,
+// and a file under the loaded table still goes. Anchoring on Metadata().Location()
+// would remove the sibling's file and fail this test.
+func TestTheExpireCleanupAnchorsOnTheLoadedPathNotTheMovedLocation(t *testing.T) {
+	ctx := context.Background()
+	r := newCoverageRig(t, nil)
+	tableDir := strings.TrimSuffix(r.tbl.Location(), "/")
+	parent := tableDir[:strings.LastIndexByte(tableDir, '/')]
+	siblingFile := parent + "/sibling/data/victim.parquet"
+	ownFile := tableDir + "/data/own-old.parquet"
+	r.write(siblingFile)
+	r.write(ownFile)
+
+	schema := iceberg.NewSchema(1, iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int32, Required: true})
+	moved, err := NewMetadata(schema, iceberg.UnpartitionedSpec, UnsortedSortOrder, parent, iceberg.Properties{PropertyFormatVersion: "2"})
+	require.NoError(t, err)
+	require.Equal(t, parent, strings.TrimSuffix(moved.Location(), "/"))
+	r.cat.meta = moved
+	loaded := tableDir + "/metadata/00000.json"
+	r.tbl = New(Identifier{"default", "cov"}, moved, loaded, r.tbl.fsF, r.cat).
+		WithManifestReadIO(func(fs iceio.IO) iceio.IO { r.hook.inner = fs; return r.hook })
+
+	txn := r.tbl.NewTransaction()
+	require.NoError(t, txn.AddFiles(ctx, []string{siblingFile, ownFile}, nil, false)) // s1: a sibling's file next to the table's own
+	s1, err := txn.Commit(ctx)
+	require.NoError(t, err)
+	r.tbl = s1
+	keep := r.next()
+	txn = r.tbl.NewTransaction()
+	require.NoError(t, txn.ReplaceDataFiles(ctx, []string{siblingFile, ownFile}, []string{keep}, nil)) // s2 drops both
+	s2, err := txn.Commit(ctx)
+	require.NoError(t, err)
+	r.tbl = s2
+	txn = r.tbl.NewTransaction()
+	require.NoError(t, txn.AddFiles(ctx, []string{r.next()}, nil, false)) // s3, so s1 and s2 can go
+	s3, err := txn.Commit(ctx)
+	require.NoError(t, err)
+	r.tbl = s3
+	time.Sleep(5 * time.Millisecond)
+	txn = r.tbl.NewTransaction()
+	require.NoError(t, txn.ExpireSnapshots(WithRetainLast(1), WithOlderThan(0), WithPostCommit(true)))
+	_, err = txn.Commit(ctx)
+	require.NoError(t, err)
+
+	exists := func(p string) bool { _, err := r.raw.Open(p); return err == nil }
+	require.True(t, exists(siblingFile), "the expire cleanup followed a moved location field and removed a sibling table's file")
+	require.False(t, exists(ownFile), "a file under the loaded table was not removed, so the cleanup ran nothing")
+	require.True(t, exists(keep), "a file the surviving snapshot references was removed")
+}
