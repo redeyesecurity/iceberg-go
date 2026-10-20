@@ -17,21 +17,25 @@
 
 package sql
 
-import "context"
+import (
+	"context"
+
+	"github.com/apache/iceberg-go/catalog/sql/internal/testhooks"
+)
 
 // SetCreateTxHook installs fn as the hook a create runs inside its transaction
 // before its held-directory check and insert, and returns a func that removes it.
 func SetCreateTxHook(fn func(context.Context)) (restore func()) {
-	createTxHook = fn
+	testhooks.CreateTx = fn
 
-	return func() { createTxHook = nil }
+	return func() { testhooks.CreateTx = nil }
 }
 
 // SetCreateCheckedHook installs fn as the hook a create runs between its
 // in-transaction held-directory check and its insert, and returns a func that
 // removes it.
 func SetCreateCheckedHook(fn func(context.Context)) (restore func()) {
-	createCheckedHook = fn
+	testhooks.CreateChecked = fn
 
-	return func() { createCheckedHook = nil }
+	return func() { testhooks.CreateChecked = nil }
 }

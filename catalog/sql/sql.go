@@ -33,6 +33,7 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/internal"
+	"github.com/apache/iceberg-go/catalog/sql/internal/testhooks"
 	"github.com/apache/iceberg-go/io"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/view"
@@ -211,26 +212,13 @@ func withCreateTx(ctx context.Context, db *bun.DB, fn func(context.Context, bun.
 	}
 
 	return db.RunInTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable}, func(ctx context.Context, tx bun.Tx) error {
-		if createTxHook != nil {
-			createTxHook(ctx)
+		if testhooks.CreateTx != nil {
+			testhooks.CreateTx(ctx)
 		}
 
 		return fn(ctx, tx)
 	})
 }
-
-// createTxHook, when a test sets it (SetCreateTxHook in export_test.go), runs
-// inside a create's transaction before its held-directory check and insert. It
-// exists so a test can park one create there while a peer lands on the same
-// location, which is the only way to reach the in-transaction check with a row
-// the early check could not have seen (caver-go#9666). Nil in production.
-var createTxHook func(context.Context)
-
-// createCheckedHook, when a test sets it, runs inside a create's transaction
-// after the held-directory check passed and before the insert. A test holds two
-// creates there to prove the second one cannot pass the check while the first
-// is still uncommitted (caver-go#9678).
-var createCheckedHook func(context.Context)
 
 type Catalog struct {
 	db    *bun.DB
@@ -447,8 +435,8 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 		if err := c.checkMetadataDirFree(ctx, tx, ns, tblIdent, staged.MetadataLocation()); err != nil {
 			return err
 		}
-		if createCheckedHook != nil {
-			createCheckedHook(ctx)
+		if testhooks.CreateChecked != nil {
+			testhooks.CreateChecked(ctx)
 		}
 		_, err := tx.NewInsert().Model(&sqlIcebergTable{
 			CatalogName:      c.name,
@@ -555,8 +543,8 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 		if err := c.checkMetadataDirFree(ctx, tx, strings.Join(ns, "."), tblName, staged.MetadataLocation()); err != nil {
 			return err
 		}
-		if createCheckedHook != nil {
-			createCheckedHook(ctx)
+		if testhooks.CreateChecked != nil {
+			testhooks.CreateChecked(ctx)
 		}
 		_, err := tx.NewInsert().Model(&sqlIcebergTable{
 			CatalogName:      c.name,

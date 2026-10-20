@@ -40,9 +40,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/klauspost/compress v1.18.7
-	github.com/microsoft/go-mssqldb v1.9.2
 	github.com/pterm/pterm v0.12.83
-	github.com/sijms/go-ora/v2 v2.9.0
 	github.com/stretchr/testify v1.11.1
 	github.com/substrait-io/substrait-go/v8 v8.1.0
 	github.com/testcontainers/testcontainers-go/modules/compose v0.42.0
@@ -157,8 +155,6 @@ require (
 	github.com/gofrs/flock v0.13.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
-	github.com/golang-sql/civil v0.0.0-20220223132316-b832511892a9 // indirect
-	github.com/golang-sql/sqlexp v0.1.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/google/s2a-go v0.1.9 // indirect

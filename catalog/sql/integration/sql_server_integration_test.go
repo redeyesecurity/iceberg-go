@@ -17,7 +17,7 @@
 
 //go:build integration
 
-package sql_test
+package integration_test
 
 import (
 	"context"
@@ -244,7 +244,7 @@ func serverHeldCreates(t *testing.T, cat *sqlcat.Catalog, warehouse string, dial
 	var mu sync.Mutex
 	checked := 0
 	both := make(chan struct{})
-	defer sqlcat.SetCreateCheckedHook(func(context.Context) {
+	defer setCreateCheckedHook(func(context.Context) {
 		mu.Lock()
 		checked++
 		if checked == 2 {
