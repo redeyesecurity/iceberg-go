@@ -145,6 +145,11 @@ type sqlIcebergTable struct {
 	IcebergType              string // TableType or ViewType
 	MetadataLocation         sql.NullString
 	PreviousMetadataLocation sql.NullString
+	// Location is the table location this catalog assigned at create, the
+	// value it vouches for to the commit path and the orphan scan
+	// (table.ConfirmedLocationProvider, caver-go#9633). NULL on a row written
+	// before the column existed, which confirms nothing.
+	Location sql.NullString `bun:",nullzero"`
 }
 
 type sqlIcebergNamespaceProps struct {
@@ -304,7 +309,83 @@ func (c *Catalog) DropSQLTables(ctx context.Context) error {
 }
 
 func (c *Catalog) ensureTablesExist() error {
-	return c.CreateSQLTables(context.Background())
+	ctx := context.Background()
+	if err := c.CreateSQLTables(ctx); err != nil {
+		return err
+	}
+
+	return c.ensureLocationColumn(ctx)
+}
+
+// ensureLocationColumn adds iceberg_tables.location to a database created
+// before the column existed. The probe is a select of the column on no rows,
+// which every dialect accepts; only when it fails is the column added, with
+// the dialect's own ADD syntax (addLocationColumnSQL). Rows already present
+// keep NULL there and confirm nothing until a create or a backfill sets them.
+func (c *Catalog) ensureLocationColumn(ctx context.Context) error {
+	var probe sql.NullString
+	var err error
+	if c.db.Dialect().Name() == dialect.SQLite {
+		// SQLite reads a double-quoted identifier that names no column as a
+		// string literal, so a quoted probe passes on a database without the
+		// column; its identifiers are case-insensitive, so bare is safe.
+		err = c.db.NewRaw("SELECT location FROM iceberg_tables WHERE 1 = 0").Scan(ctx, &probe)
+	} else {
+		err = c.db.NewRaw("SELECT ? FROM ? WHERE 1 = 0", bun.Ident("location"), bun.Ident("iceberg_tables")).Scan(ctx, &probe)
+	}
+	if err == nil || errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if _, err := c.db.ExecContext(ctx, addLocationColumnSQL(c.db.Dialect().Name())); err != nil {
+		return fmt.Errorf("adding iceberg_tables.location: %w", err)
+	}
+
+	return nil
+}
+
+// addLocationColumnSQL is the ALTER that adds the nullable location column for
+// the dialect: SQL Server takes no COLUMN keyword and spells the type NVARCHAR,
+// Oracle spells it VARCHAR2, the rest take ADD COLUMN ... VARCHAR.
+func addLocationColumnSQL(d dialect.Name) string {
+	switch d {
+	case dialect.MSSQL:
+		return "ALTER TABLE iceberg_tables ADD location NVARCHAR(2048) NULL"
+	case dialect.Oracle:
+		return "ALTER TABLE iceberg_tables ADD location VARCHAR2(2048)"
+	default:
+		return "ALTER TABLE iceberg_tables ADD COLUMN location VARCHAR(2048)"
+	}
+}
+
+// ConfirmedTableLocation is the location this catalog assigned the table at
+// create, from its own row, where the metadata file's contents cannot reach
+// it (table.ConfirmedLocationProvider, caver-go#9633). ok is false for a row
+// with no location (written before the column) and for a table that has no
+// row yet, the staged table of a create-by-commit.
+func (c *Catalog) ConfirmedTableLocation(ctx context.Context, ident table.Identifier) (string, bool, error) {
+	ns := strings.Join(catalog.NamespaceFromIdent(ident), ".")
+	tbl := catalog.TableNameFromIdent(ident)
+	row, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (*sqlIcebergTable, error) {
+		t := new(sqlIcebergTable)
+		err := tx.NewSelect().Model(t).Column("location").
+			Where("? = ?", bun.Ident("catalog_name"), c.name).
+			Where("? = ?", bun.Ident("table_namespace"), ns).
+			Where("? = ?", bun.Ident("table_name"), tbl).
+			Scan(ctx)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+
+		return t, err
+	})
+	if err != nil {
+		return "", false, fmt.Errorf("confirmed location of %s: %w", ident, err)
+	}
+	if row == nil || !row.Location.Valid || row.Location.String == "" {
+		return "", false, nil
+	}
+
+	return row.Location.String, true, nil
 }
 
 // namespaceExists asks EXISTS without a LIMIT: EXISTS stops at the first row
@@ -444,6 +525,7 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 			TableName:        tblIdent,
 			MetadataLocation: sql.NullString{String: staged.MetadataLocation(), Valid: true},
 			IcebergType:      TableType,
+			Location:         sql.NullString{String: staged.Metadata().Location(), Valid: true},
 		}).Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
@@ -552,6 +634,7 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 			TableName:        tblName,
 			IcebergType:      TableType,
 			MetadataLocation: sql.NullString{Valid: true, String: staged.MetadataLocation()},
+			Location:         sql.NullString{Valid: true, String: staged.Metadata().Location()},
 		}).Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
