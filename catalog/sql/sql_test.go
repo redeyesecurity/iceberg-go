@@ -687,6 +687,102 @@ func (s *SqliteCatalogTestSuite) TestConcurrentCreatesOntoOneLocationLandOnce() 
 	s.LessOrEqual(landed, 1, "concurrent creates onto one location: %v", errs)
 }
 
+// parkedCreateIsRefusedAfterAPeerLands pins the in-transaction held-directory
+// check at one create site (caver-go#9666 F8): create A is parked inside its
+// transaction before that check, create B lands on the same location in the
+// meantime, and when A resumes its check must see B's committed row and refuse
+// with ErrTableAlreadyExists, leaving no table behind. Without the in-transaction
+// check A's early check had already passed, so A would insert and two tables
+// would share one metadata directory. createA is the parked create; it returns
+// the error it ended with.
+func (s *SqliteCatalogTestSuite) parkedCreateIsRefusedAfterAPeerLands(createA func(ctx context.Context, cat *sqlcat.Catalog, ident table.Identifier, loc string) error) {
+	ctx := context.Background()
+	cat := s.getCatalogSqlite()
+	base := s.randomTableIdentifier()
+	ns := catalog.NamespaceFromIdent(base)
+	s.Require().NoError(cat.CreateNamespace(ctx, ns, nil))
+	loc := "file://" + filepath.Join(s.warehouse, "parked_"+catalog.TableNameFromIdent(base))
+	a := table.Identifier{ns[0], "a_" + catalog.TableNameFromIdent(base)}
+	b := table.Identifier{ns[0], "b_" + catalog.TableNameFromIdent(base)}
+
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	restore := sqlcat.SetCreateTxHook(func(context.Context) {
+		once.Do(func() {
+			close(parked)
+			<-release
+		})
+	})
+	defer restore()
+
+	errA := make(chan error, 1)
+	go func() { errA <- createA(ctx, cat, a, loc) }()
+	<-parked
+	restore() // B must not park: only the first create is held
+	_, err := cat.CreateTable(ctx, b, tableSchemaNested, catalog.WithLocation(loc))
+	s.Require().NoError(err, "B, the peer, lands while A is parked")
+	close(release)
+
+	s.ErrorIs(<-errA, catalog.ErrTableAlreadyExists, "A resumed after B landed: its in-transaction check must refuse")
+	_, err = cat.LoadTable(ctx, a)
+	s.ErrorIs(err, catalog.ErrNoSuchTable, "the refused create left no table behind")
+	s.NoError(cat.DropTable(ctx, b))
+}
+
+func (s *SqliteCatalogTestSuite) TestACreateParkedAtItsTransactionIsRefusedAfterAPeerLands() {
+	s.parkedCreateIsRefusedAfterAPeerLands(func(ctx context.Context, cat *sqlcat.Catalog, ident table.Identifier, loc string) error {
+		_, err := cat.CreateTable(ctx, ident, tableSchemaNested, catalog.WithLocation(loc))
+
+		return err
+	})
+}
+
+func (s *SqliteCatalogTestSuite) TestACreateByCommitParkedAtItsTransactionIsRefusedAfterAPeerLands() {
+	s.parkedCreateIsRefusedAfterAPeerLands(func(ctx context.Context, cat *sqlcat.Catalog, ident table.Identifier, loc string) error {
+		_, _, err := cat.CommitTable(ctx, ident,
+			[]table.Requirement{table.AssertCreate()},
+			[]table.Update{
+				table.NewAssignUUIDUpdate(uuid.New()),
+				table.NewUpgradeFormatVersionUpdate(2),
+				table.NewAddSchemaUpdate(tableSchemaNested),
+				table.NewSetCurrentSchemaUpdate(-1),
+				table.NewSetLocationUpdate(loc),
+			})
+
+		return err
+	})
+}
+
+// The reverse order of the sibling case (caver-go#9666 N1): meta_x2 exists first,
+// then meta_x is created. The held directory is compared with its trailing
+// separator, so wh/meta_x/ is not a prefix of wh/meta_x2/... and meta_x lands;
+// comparing without the separator refuses it.
+func (s *SqliteCatalogTestSuite) TestCreateTableMetadataDirReverseOrderIsNotAPrefixMatch() {
+	ctx := context.Background()
+	for _, cat := range []*sqlcat.Catalog{s.getCatalogMemory(), s.getCatalogSqlite()} {
+		first := s.randomTableIdentifier()
+		ns := catalog.NamespaceFromIdent(first)
+		s.Require().NoError(cat.CreateNamespace(ctx, ns, nil))
+		metaDir := filepath.Join(s.warehouse, "meta_"+catalog.TableNameFromIdent(first))
+
+		longer := table.Identifier{ns[0], "longer_" + catalog.TableNameFromIdent(first)}
+		_, err := cat.CreateTable(ctx, longer, tableSchemaNested,
+			catalog.WithLocation(filepath.Join(s.warehouse, "longer_"+catalog.TableNameFromIdent(first))),
+			catalog.WithProperties(iceberg.Properties{table.WriteMetadataPathKey: metaDir + "2"}))
+		s.Require().NoError(err)
+
+		shorter := table.Identifier{ns[0], "shorter_" + catalog.TableNameFromIdent(first)}
+		_, err = cat.CreateTable(ctx, shorter, tableSchemaNested,
+			catalog.WithLocation(filepath.Join(s.warehouse, "shorter_"+catalog.TableNameFromIdent(first))),
+			catalog.WithProperties(iceberg.Properties{table.WriteMetadataPathKey: metaDir}))
+		s.NoError(err, "meta_x after meta_x2: a directory that is only a name prefix of an existing one is free")
+
+		s.NoError(cat.DropTable(ctx, shorter))
+		s.NoError(cat.DropTable(ctx, longer))
+	}
+}
+
 func (s *SqliteCatalogTestSuite) TestCreateTableWithoutNamespace() {
 	catalogs := []*sqlcat.Catalog{s.getCatalogMemory(), s.getCatalogSqlite()}
 	tblName := table.Identifier{tableName()}

@@ -182,9 +182,20 @@ func withWriteTx(ctx context.Context, db *bun.DB, fn func(context.Context, bun.T
 // the window stays open there.
 func withCreateTx(ctx context.Context, db *bun.DB, fn func(context.Context, bun.Tx) error) error {
 	return db.RunInTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable}, func(ctx context.Context, tx bun.Tx) error {
+		if createTxHook != nil {
+			createTxHook(ctx)
+		}
+
 		return fn(ctx, tx)
 	})
 }
+
+// createTxHook, when a test sets it (SetCreateTxHook in export_test.go), runs
+// inside a create's transaction before its held-directory check and insert. It
+// exists so a test can park one create there while a peer lands on the same
+// location, which is the only way to reach the in-transaction check with a row
+// the early check could not have seen (caver-go#9666). Nil in production.
+var createTxHook func(context.Context)
 
 type Catalog struct {
 	db    *bun.DB
