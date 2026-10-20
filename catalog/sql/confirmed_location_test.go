@@ -249,6 +249,16 @@ func TestSqlCatalogKeepsTheRecordedLocationAcrossCommits9633(t *testing.T) {
 		require.ErrorIs(t, err, table.ErrConfirmedLocationRefused)
 	})
 
+	t.Run("the same directory spelled bare is the same location", func(t *testing.T) {
+		// A base whose location field spells the recorded file:// location
+		// without the scheme names the same directory; it is not a move.
+		spelled, sIdent := createIn(t, cat, "s")
+		bare := strings.TrimPrefix(spelled.Location(), "file://")
+		plantFile(t, spelled, bare, nil)
+		_, _, err := cat.CommitTable(ctx, sIdent, nil, []table.Update{table.NewSetPropertiesUpdate(iceberg.Properties{"k": "v"})})
+		require.NoError(t, err)
+	})
+
 	t.Run("a rename keeps it", func(t *testing.T) {
 		renamed := table.Identifier{"db", "t_renamed"}
 		_, err := cat.RenameTable(ctx, ident, renamed)
