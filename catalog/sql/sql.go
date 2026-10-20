@@ -264,25 +264,46 @@ func (c *Catalog) namespaceExists(ctx context.Context, ns string) (bool, error) 
 	})
 }
 
-// checkMetadataDirFree refuses a create whose first metadata file would sit
-// in the directory of a metadata file this catalog already points at for a
-// DIFFERENT table (caver-go#9633). The same identifier is left out: a create
-// of a table that already exists reaches the insert and fails there with the
-// duplicate-table error callers have always seen, so this check only ever
-// speaks for another table's directory.
+// checkMetadataDirFree refuses a create whose first metadata file would sit in
+// the directory of a metadata file this catalog already points at for a
+// DIFFERENT table (caver-go#9633). The same identifier is left out: a create of a
+// table that already exists reaches the insert and fails there with the
+// duplicate-table error callers have always seen, so this check only ever speaks
+// for another table's directory.
+//
+// The directory is compared as a string prefix with SUBSTR, which every dialect
+// this catalog runs on (sqlite, postgres, mysql) spells the same way; LIKE would
+// need an ESCAPE clause, and MySQL does not accept a backslash there. Both
+// spellings of a local path are asked for, with and without the file:// scheme,
+// because a row stored as file:///w/t and a create spelled /w/t name one
+// directory. Other schemes are compared as written.
 func (c *Catalog) checkMetadataDirFree(ctx context.Context, ns, tbl, newMetadataLoc string) error {
 	i := strings.LastIndexByte(newMetadataLoc, '/')
 	if i < 0 {
 		return nil
 	}
-	prefix := likeEscaper.Replace(newMetadataLoc[:i+1]) + "%"
+	dir := newMetadataLoc[:i+1]
+	spellings := []string{dir}
+	switch {
+	case strings.HasPrefix(dir, "file://"):
+		spellings = append(spellings, strings.TrimPrefix(dir, "file://"))
+	case strings.HasPrefix(dir, "/"):
+		spellings = append(spellings, "file://"+dir)
+	}
 
 	taken, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (bool, error) {
-		return tx.NewSelect().Model((*sqlIcebergTable)(nil)).
+		q := tx.NewSelect().Model((*sqlIcebergTable)(nil)).
 			Where("catalog_name = ?", c.name).
-			Where("NOT (table_namespace = ? AND table_name = ?)", ns, tbl).
-			Where("metadata_location LIKE ? ESCAPE '\\'", prefix).
-			Limit(1).Exists(ctx)
+			Where("NOT (table_namespace = ? AND table_name = ?)", ns, tbl)
+		q = q.WhereGroup(" AND ", func(q *bun.SelectQuery) *bun.SelectQuery {
+			for _, sp := range spellings {
+				q = q.WhereOr("SUBSTR(metadata_location, 1, ?) = ?", len(sp), sp)
+			}
+
+			return q
+		})
+
+		return q.Limit(1).Exists(ctx)
 	})
 	if err != nil {
 		return err
@@ -293,8 +314,6 @@ func (c *Catalog) checkMetadataDirFree(ctx context.Context, ns, tbl, newMetadata
 
 	return nil
 }
-
-var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 func checkValidNamespace(ident table.Identifier) error {
 	if len(ident) < 1 {
@@ -394,6 +413,15 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 	wfs, ok := afs.(io.WriteFileIO)
 	if !ok {
 		return nil, "", errors.New("loaded filesystem IO does not support writing")
+	}
+	// A create by commit (no current table, AssertCreate) places its first
+	// metadata file like CreateTable does, so it is held to the same rule: not
+	// into a directory another table in this catalog already points at
+	// (caver-go#9633).
+	if current == nil {
+		if err := c.checkMetadataDirFree(ctx, strings.Join(ns, "."), tblName, staged.MetadataLocation()); err != nil {
+			return nil, "", err
+		}
 	}
 	compression := staged.Properties().Get(table.MetadataCompressionKey, table.MetadataCompressionDefault)
 	if err := internal.WriteTableMetadata(staged.Metadata(), wfs, staged.MetadataLocation(), compression); err != nil {
