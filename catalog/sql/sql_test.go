@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -577,6 +578,113 @@ func (s *SqliteCatalogTestSuite) TestCreateTableOnAnotherTablesLocationIsRefused
 		s.NoError(cat.DropTable(ctx, third))
 		s.NoError(cat.DropTable(ctx, first))
 	}
+}
+
+// The held-directory check compares whole directories (caver-go#9666): a table
+// whose write.metadata.path is wh/meta2 is not inside another table's wh/meta,
+// so it lands, and a create spelled with file:// is refused when the table it
+// collides with was stored with the bare path. The premise checks pin that the
+// first table's row really carries the bare spelling.
+func (s *SqliteCatalogTestSuite) TestCreateTableMetadataDirSiblingAndBareSpelling() {
+	ctx := context.Background()
+	for _, cat := range []*sqlcat.Catalog{s.getCatalogMemory(), s.getCatalogSqlite()} {
+		first := s.randomTableIdentifier()
+		ns := catalog.NamespaceFromIdent(first)
+		s.Require().NoError(cat.CreateNamespace(ctx, ns, nil))
+		metaDir := filepath.Join(s.warehouse, "meta_"+catalog.TableNameFromIdent(first))
+		tbl, err := cat.CreateTable(ctx, first, tableSchemaNested,
+			catalog.WithLocation(filepath.Join(s.warehouse, catalog.TableNameFromIdent(first))),
+			catalog.WithProperties(iceberg.Properties{table.WriteMetadataPathKey: metaDir}))
+		s.Require().NoError(err)
+		s.Require().True(strings.HasPrefix(tbl.MetadataLocation(), metaDir+"/"), "premise: the first metadata file is stored bare under %s: %s", metaDir, tbl.MetadataLocation())
+
+		sibling := table.Identifier{ns[0], "sibling_" + catalog.TableNameFromIdent(first)}
+		sib, err := cat.CreateTable(ctx, sibling, tableSchemaNested,
+			catalog.WithLocation(filepath.Join(s.warehouse, "sibling_"+catalog.TableNameFromIdent(first))),
+			catalog.WithProperties(iceberg.Properties{table.WriteMetadataPathKey: metaDir + "2"}))
+		s.Require().NoError(err, "a metadata directory that only shares a name prefix is free")
+		s.True(strings.HasPrefix(sib.MetadataLocation(), metaDir+"2/"), "premise: the sibling landed in its own directory: %s", sib.MetadataLocation())
+
+		second := table.Identifier{ns[0], "second_" + catalog.TableNameFromIdent(first)}
+		_, err = cat.CreateTable(ctx, second, tableSchemaNested,
+			catalog.WithLocation(filepath.Join(s.warehouse, "second_"+catalog.TableNameFromIdent(first))),
+			catalog.WithProperties(iceberg.Properties{table.WriteMetadataPathKey: "file://" + metaDir}))
+		s.ErrorIs(err, catalog.ErrTableAlreadyExists, "a file:// create onto a directory stored bare")
+		_, err = cat.LoadTable(ctx, second)
+		s.ErrorIs(err, catalog.ErrNoSuchTable, "the refused create left no table behind")
+
+		s.NoError(cat.DropTable(ctx, sibling))
+		s.NoError(cat.DropTable(ctx, first))
+	}
+}
+
+// The directory compare is case-sensitive (caver-go#9666): a create at .../CASE
+// lands beside a table at .../case. It runs only where the warehouse filesystem
+// is itself case-sensitive, because on a case-insensitive one the two spellings
+// really are one directory.
+func (s *SqliteCatalogTestSuite) TestCreateTableMetadataDirCaseSensitive() {
+	probe := filepath.Join(s.warehouse, "caseprobe")
+	s.Require().NoError(os.MkdirAll(probe, 0o755))
+	if _, err := os.Stat(filepath.Join(s.warehouse, "CASEPROBE")); err == nil {
+		s.T().Skip("the warehouse filesystem is case-insensitive")
+	}
+
+	ctx := context.Background()
+	for _, cat := range []*sqlcat.Catalog{s.getCatalogMemory(), s.getCatalogSqlite()} {
+		lower := s.randomTableIdentifier()
+		ns := catalog.NamespaceFromIdent(lower)
+		s.Require().NoError(cat.CreateNamespace(ctx, ns, nil))
+		_, err := cat.CreateTable(ctx, lower, tableSchemaNested,
+			catalog.WithLocation("file://"+filepath.Join(s.warehouse, "case_"+catalog.TableNameFromIdent(lower))))
+		s.Require().NoError(err)
+
+		upper := table.Identifier{ns[0], "upper_" + catalog.TableNameFromIdent(lower)}
+		_, err = cat.CreateTable(ctx, upper, tableSchemaNested,
+			catalog.WithLocation("file://"+filepath.Join(s.warehouse, "CASE_"+catalog.TableNameFromIdent(lower))))
+		s.NoError(err, "a location differing only in case is another directory")
+
+		s.NoError(cat.DropTable(ctx, upper))
+		s.NoError(cat.DropTable(ctx, lower))
+	}
+}
+
+// Concurrent creates onto one location land at most once (caver-go#9666): the
+// held-directory check runs again inside the insert's serializable transaction,
+// so two creates that both pass the early check cannot both commit. A loser
+// sees either the refusal or the database's conflict error.
+func (s *SqliteCatalogTestSuite) TestConcurrentCreatesOntoOneLocationLandOnce() {
+	ctx := context.Background()
+	cat := s.getCatalogSqlite()
+	base := s.randomTableIdentifier()
+	ns := catalog.NamespaceFromIdent(base)
+	s.Require().NoError(cat.CreateNamespace(ctx, ns, nil))
+	loc := "file://" + filepath.Join(s.warehouse, "shared_"+catalog.TableNameFromIdent(base))
+
+	const n = 8
+	errs := make([]error, n)
+	idents := make([]table.Identifier, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range n {
+		idents[i] = table.Identifier{ns[0], fmt.Sprintf("racer%d_%s", i, catalog.TableNameFromIdent(base))}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, errs[i] = cat.CreateTable(ctx, idents[i], tableSchemaNested, catalog.WithLocation(loc))
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	landed := 0
+	for i, err := range errs {
+		if err == nil {
+			landed++
+			s.NoError(cat.DropTable(ctx, idents[i]))
+		}
+	}
+	s.LessOrEqual(landed, 1, "concurrent creates onto one location: %v", errs)
 }
 
 func (s *SqliteCatalogTestSuite) TestCreateTableWithoutNamespace() {
