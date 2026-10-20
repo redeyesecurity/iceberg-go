@@ -1015,6 +1015,31 @@ func TestConstructDefaultMainBranch(t *testing.T) {
 	require.Equal(t, meta.(*metadataV2).SnapshotRefs[MainBranch].SnapshotID, meta.CurrentSnapshot().SnapshotID)
 }
 
+// TestAddSchemaLeavesCallerSchemaID pins caver-go#9680: AddSchema assigns a
+// new id to a schema whose id is taken, and must do it on a copy, because the
+// caller's schema may be shared (iceberg.PositionalDeleteSchema is a package
+// global that parallel tests hand to their own builders).
+func TestAddSchemaLeavesCallerSchemaID(t *testing.T) {
+	builder := builderWithoutChanges(2)
+	added := iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "w", Type: iceberg.PrimitiveTypes.Int64, Required: true})
+
+	require.NoError(t, builder.AddSchema(added))
+
+	require.Equal(t, 0, added.ID, "the caller's schema keeps its own id")
+	require.Len(t, builder.schemaList, 2)
+	stored := builder.schemaList[1]
+	require.Equal(t, 1, stored.ID)
+	require.NotSame(t, added, stored)
+	require.True(t, stored.Equals(added))
+	require.NotNil(t, builder.lastAddedSchemaID)
+	require.Equal(t, 1, *builder.lastAddedSchemaID)
+
+	update, ok := builder.updates[len(builder.updates)-1].(*addSchemaUpdate)
+	require.True(t, ok)
+	require.Same(t, stored, update.Schema, "the update carries the schema with the assigned id")
+}
+
 func TestAddIncompatibleCurrentSchemaFails(t *testing.T) {
 	builder := builderWithoutChanges(2)
 	addedSchema := iceberg.NewSchema(1)
