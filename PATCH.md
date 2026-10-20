@@ -263,3 +263,23 @@ created under today's scheme.
 `table` unit tests and the new `catalog/sql` integration test that exercises
 `WithPreserveFieldIDs()` through the real SQL-catalog `CreateTable` path
 caver-go uses).
+
+## 5. `MetadataBuilder.AddSchema` stores a copy, and `-race ./table/...` is part of green
+
+`AddSchema` used to write the id it assigned back into the caller's
+`*iceberg.Schema` and keep that pointer. The position-delete tests hand
+`iceberg.PositionalDeleteSchema`, a package global, to their own builders in
+parallel, so under `-race` one test's write raced another test's
+`Build -> validate` read (caver-go#9680). Production callers pass a table's
+own schema, so nothing in a caver-go binary tripped it. `AddSchema` now
+stores `iceberg.NewSchemaWithIdentifiers(newID, ...)` when the id changes,
+the same thing `view.MetadataBuilder.addSchema` already did, and the tests
+give each builder its own copy of the positional-delete schema.
+
+### Testing
+
+The lineage suite is `go test ./ ./io/... ./table/... ./catalog/...` AND
+`go test -race ./table/...`. The fork's workflows do not run, so a change to
+`table/` records both results in its PR. `-race ./table/...` needs the
+`PartitionField.EscapedName` fix from fork PR #31 as well: with only one of
+the two on the branch, `./table` still reds under `-race`.

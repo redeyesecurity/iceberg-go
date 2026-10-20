@@ -353,7 +353,12 @@ func (b *MetadataBuilder) AddSchema(schema *iceberg.Schema) error {
 
 	b.lastColumnId = max(b.lastColumnId, schema.HighestFieldID())
 
-	schema.ID = newSchemaID
+	// Never write the assigned id into the caller's schema: it may be shared
+	// (iceberg.PositionalDeleteSchema is a package global), so store a fresh
+	// copy when the id changes, the way the view builder does.
+	if schema.ID != newSchemaID {
+		schema = iceberg.NewSchemaWithIdentifiers(newSchemaID, schema.IdentifierFieldIDs, schema.Fields()...)
+	}
 
 	b.schemaList = append(b.schemaList, schema)
 	b.updates = append(b.updates, NewAddSchemaUpdate(schema))

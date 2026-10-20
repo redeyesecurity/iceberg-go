@@ -162,6 +162,13 @@ func TestPositionDeletePartitionedFanoutWriterProcessBatch(t *testing.T) {
 	}
 }
 
+// positionalDeleteSchema returns a fresh copy of iceberg.PositionalDeleteSchema
+// for a test to hand to a MetadataBuilder, so parallel tests never share the
+// package global through the builder.
+func positionalDeleteSchema() *iceberg.Schema {
+	return iceberg.NewSchema(0, iceberg.PositionalDeleteSchema.Fields()...)
+}
+
 func TestPositionDeletePartitionedFanoutWriterPartitionPathIsDeterministic(t *testing.T) {
 	t.Parallel()
 
@@ -190,7 +197,7 @@ func TestPositionDeletePartitionedFanoutWriterPartitionPathIsDeterministic(t *te
 
 	metadataBuilder, err := NewMetadataBuilder(2)
 	require.NoError(t, err)
-	err = metadataBuilder.AddSchema(iceberg.PositionalDeleteSchema)
+	err = metadataBuilder.AddSchema(positionalDeleteSchema())
 	require.NoError(t, err)
 	err = metadataBuilder.SetCurrentSchemaID(0)
 	require.NoError(t, err)
@@ -679,7 +686,7 @@ func TestPositionDeleteUnpartitionedSortOrderID(t *testing.T) {
 
 	metadataBuilder, err := NewMetadataBuilder(2)
 	require.NoError(t, err)
-	require.NoError(t, metadataBuilder.AddSchema(iceberg.PositionalDeleteSchema))
+	require.NoError(t, metadataBuilder.AddSchema(positionalDeleteSchema()))
 	require.NoError(t, metadataBuilder.SetCurrentSchemaID(0))
 	unpartitioned := *iceberg.UnpartitionedSpec
 	require.NoError(t, metadataBuilder.AddPartitionSpec(&unpartitioned, true))
