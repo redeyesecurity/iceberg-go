@@ -617,16 +617,28 @@ func TestTheExpireCleanupAnchorsOnTheLoadedPathNotTheMovedLocation(t *testing.T)
 
 // The orphan scan builds its referenced set from every snapshot's list and manifests
 // through the hook, and a list or manifest the hook refuses aborts the scan with
-// nothing deleted (caver-go#9638).
+// nothing deleted (caver-go#9638). The scan runs on a table loaded from the catalog,
+// as every real sweep does. The refusal names manifests by their "-m<N>.avro" shape:
+// the first shape of this test refused "-m0.avro", a name no manifest this rig's
+// appends write carries (they write "-m1.avro"), so the hook refused nothing and the
+// scan returned nil; measured, not guessed, before the pattern was widened.
 func TestTheOrphanScanReadsManifestsThroughTheHook(t *testing.T) {
 	ctx := context.Background()
+	scanTable := func(t *testing.T, r *coverageRig) *Table {
+		t.Helper()
+		loaded, err := r.cat.LoadTable(ctx, r.tbl.Identifier())
+		require.NoError(t, err)
+
+		return loaded.WithManifestReadIO(func(fs iceio.IO) iceio.IO { r.hook.inner = fs; return r.hook })
+	}
 	t.Run("every list and manifest open is hooked", func(t *testing.T) {
 		r := newCoverageRig(t, nil)
 		r.appendOne(t)
 		r.appendOne(t)
+		tbl := scanTable(t, r)
 		r.raw.take()
 		r.hook.take()
-		_, err := r.tbl.DeleteOrphanFiles(ctx, WithDryRun(true), WithFilesOlderThan(0))
+		_, err := tbl.DeleteOrphanFiles(ctx, WithDryRun(true), WithFilesOlderThan(0))
 		require.NoError(t, err)
 		requireEveryManifestOpenHooked(t, r, "orphan scan")
 	})
@@ -634,9 +646,10 @@ func TestTheOrphanScanReadsManifestsThroughTheHook(t *testing.T) {
 		r := newCoverageRig(t, nil)
 		r.appendOne(t)
 		r.appendOne(t)
-		r.hook.refuse = "-m0.avro"
+		tbl := scanTable(t, r)
+		r.hook.refuse = "-m" // every manifest file name is <commit uuid>-m<N>.avro; a uuid has no "-m"
 		var deleted []string
-		_, err := r.tbl.DeleteOrphanFiles(ctx, WithFilesOlderThan(0),
+		_, err := tbl.DeleteOrphanFiles(ctx, WithFilesOlderThan(0),
 			WithDeleteFunc(func(p string) error { deleted = append(deleted, p); return nil }))
 		require.ErrorIs(t, err, errHookRefused)
 		require.Empty(t, deleted, "a refused manifest read must delete nothing")
