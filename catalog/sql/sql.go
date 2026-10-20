@@ -145,6 +145,11 @@ type sqlIcebergTable struct {
 	IcebergType              string // TableType or ViewType
 	MetadataLocation         sql.NullString
 	PreviousMetadataLocation sql.NullString
+	// Location is the table location this catalog assigned at create, the
+	// value it vouches for to the commit path and the orphan scan
+	// (table.ConfirmedLocationProvider, caver-go#9633). NULL on a row written
+	// before the column existed, which confirms nothing.
+	Location sql.NullString `bun:",nullzero"`
 }
 
 type sqlIcebergNamespaceProps struct {
@@ -304,7 +309,89 @@ func (c *Catalog) DropSQLTables(ctx context.Context) error {
 }
 
 func (c *Catalog) ensureTablesExist() error {
-	return c.CreateSQLTables(context.Background())
+	ctx := context.Background()
+	if err := c.CreateSQLTables(ctx); err != nil {
+		return err
+	}
+
+	return c.ensureLocationColumn(ctx)
+}
+
+// ensureLocationColumn adds iceberg_tables.location to a database created
+// before the column existed. The probe is a select of the column on no rows,
+// which every dialect accepts; only when it fails is the column added, with
+// the dialect's own ADD syntax (addLocationColumnQuery). Rows already present
+// keep NULL there and confirm nothing until a create or a backfill sets them.
+func (c *Catalog) ensureLocationColumn(ctx context.Context) error {
+	var probe sql.NullString
+	var err error
+	if c.db.Dialect().Name() == dialect.SQLite {
+		// SQLite reads a double-quoted identifier that names no column as a
+		// string literal, so a quoted probe passes on a database without the
+		// column; its identifiers are case-insensitive, so bare is safe.
+		err = c.db.NewRaw("SELECT location FROM iceberg_tables WHERE 1 = 0").Scan(ctx, &probe)
+	} else {
+		err = c.db.NewRaw("SELECT ? FROM ? WHERE 1 = 0", bun.Ident("location"), bun.Ident("iceberg_tables")).Scan(ctx, &probe)
+	}
+	if err == nil || errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if _, err := addLocationColumnQuery(c.db).Exec(ctx); err != nil {
+		return fmt.Errorf("adding iceberg_tables.location: %w", err)
+	}
+
+	return nil
+}
+
+// addLocationColumnQuery is the ALTER that adds the nullable location column.
+// Table and column go through the dialect's identifier quoting, the same
+// quoting bun's CREATE TABLE used for the column on a fresh database, so on
+// Oracle the added column is "location" and not LOCATION and the quoted probe
+// finds it afterwards. SQL Server takes no COLUMN keyword and spells the type
+// NVARCHAR; Oracle spells it VARCHAR2; the rest take ADD COLUMN ... VARCHAR.
+func addLocationColumnQuery(db *bun.DB) *bun.RawQuery {
+	var tmpl string
+	switch db.Dialect().Name() {
+	case dialect.MSSQL:
+		tmpl = "ALTER TABLE ? ADD ? NVARCHAR(2048) NULL"
+	case dialect.Oracle:
+		tmpl = "ALTER TABLE ? ADD ? VARCHAR2(2048)"
+	default:
+		tmpl = "ALTER TABLE ? ADD COLUMN ? VARCHAR(2048)"
+	}
+
+	return db.NewRaw(tmpl, bun.Ident("iceberg_tables"), bun.Ident("location"))
+}
+
+// ConfirmedTableLocation is the location this catalog assigned the table at
+// create, from its own row, where the metadata file's contents cannot reach
+// it (table.ConfirmedLocationProvider, caver-go#9633). ok is false for a row
+// with no location (written before the column) and for a table that has no
+// row yet, the staged table of a create-by-commit.
+func (c *Catalog) ConfirmedTableLocation(ctx context.Context, ident table.Identifier) (string, bool, error) {
+	ns := strings.Join(catalog.NamespaceFromIdent(ident), ".")
+	tbl := catalog.TableNameFromIdent(ident)
+	row, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (*sqlIcebergTable, error) {
+		t := new(sqlIcebergTable)
+		err := tx.NewSelect().Model(t).Column("location").
+			Where("? = ?", bun.Ident("catalog_name"), c.name).
+			Where("? = ?", bun.Ident("table_namespace"), ns).
+			Where("? = ?", bun.Ident("table_name"), tbl).
+			Scan(ctx)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+
+		return t, err
+	})
+	if err != nil {
+		return "", false, fmt.Errorf("confirmed location of %s: %w", ident, err)
+	}
+	if row == nil || !row.Location.Valid || row.Location.String == "" {
+		return "", false, nil
+	}
+
+	return row.Location.String, true, nil
 }
 
 // namespaceExists asks EXISTS without a LIMIT: EXISTS stops at the first row
@@ -384,6 +471,77 @@ func (c *Catalog) checkMetadataDirFree(ctx context.Context, db bun.IDB, ns, tbl,
 	return nil
 }
 
+// checkLocationFree refuses a create whose location is another table's
+// recorded location, an ancestor of one (the namespace directory, say, which
+// would make every table under it this table's files) or a descendant of one
+// (inside another table's tree). Rows with no recorded location are not
+// compared; the metadata-directory check above still covers them
+// (caver-go#9633, the #25 review's F6).
+func (c *Catalog) checkLocationFree(ctx context.Context, db bun.IDB, ns, tbl, newLoc string) error {
+	var locs []string
+	err := db.NewSelect().Model((*sqlIcebergTable)(nil)).
+		Column("location").
+		Where("? = ?", bun.Ident("catalog_name"), c.name).
+		Where("NOT (? = ? AND ? = ?)", bun.Ident("table_namespace"), ns, bun.Ident("table_name"), tbl).
+		Where("? IS NOT NULL", bun.Ident("location")).
+		Scan(ctx, &locs)
+	if err != nil {
+		return err
+	}
+	for _, loc := range locs {
+		if loc == "" {
+			continue
+		}
+		if locationUnder(newLoc, loc) || locationUnder(loc, newLoc) {
+			return fmt.Errorf("%w: location %q is another table's location, or inside or above one (%q)", catalog.ErrTableAlreadyExists, newLoc, loc)
+		}
+	}
+
+	return nil
+}
+
+// locationSpellings is loc with and without the file:// scheme, the two
+// spellings a local location arrives in, each without a trailing slash.
+func locationSpellings(loc string) []string {
+	loc = strings.TrimRight(loc, "/")
+	switch {
+	case strings.HasPrefix(loc, "file://"):
+		return []string{loc, strings.TrimPrefix(loc, "file://")}
+	case strings.HasPrefix(loc, "/"):
+		return []string{loc, "file://" + loc}
+	}
+
+	return []string{loc}
+}
+
+// sameLocation reports whether a and b name the same directory in either
+// local spelling, ignoring a trailing slash.
+func sameLocation(a, b string) bool {
+	for _, x := range locationSpellings(a) {
+		for _, y := range locationSpellings(b) {
+			if x == y {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// locationUnder reports whether child is parent or a directory under it, in
+// either local spelling, at a path separator.
+func locationUnder(child, parent string) bool {
+	for _, x := range locationSpellings(child) {
+		for _, y := range locationSpellings(parent) {
+			if x == y || strings.HasPrefix(x, y+"/") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 func checkValidNamespace(ident table.Identifier) error {
 	if len(ident) < 1 {
 		return fmt.Errorf("%w: empty namespace identifier", catalog.ErrNoSuchNamespace)
@@ -425,6 +583,9 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 	if err := c.checkMetadataDirFree(ctx, c.db, ns, tblIdent, staged.MetadataLocation()); err != nil {
 		return nil, err
 	}
+	if err := c.checkLocationFree(ctx, c.db, ns, tblIdent, staged.Metadata().Location()); err != nil {
+		return nil, err
+	}
 
 	compression := staged.Table.Properties().Get(table.MetadataCompressionKey, table.MetadataCompressionDefault)
 	if err := internal.WriteTableMetadata(staged.Metadata(), wfs, staged.MetadataLocation(), compression); err != nil {
@@ -433,6 +594,9 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 
 	err = withCreateTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
 		if err := c.checkMetadataDirFree(ctx, tx, ns, tblIdent, staged.MetadataLocation()); err != nil {
+			return err
+		}
+		if err := c.checkLocationFree(ctx, tx, ns, tblIdent, staged.Metadata().Location()); err != nil {
 			return err
 		}
 		if testhooks.CreateChecked != nil {
@@ -444,6 +608,7 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 			TableName:        tblIdent,
 			MetadataLocation: sql.NullString{String: staged.MetadataLocation(), Valid: true},
 			IcebergType:      TableType,
+			Location:         sql.NullString{String: staged.Metadata().Location(), Valid: true},
 		}).Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
@@ -477,6 +642,22 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 		return current.Metadata(), current.MetadataLocation(), nil
 	}
 
+	// The location this catalog recorded at create is the one it vouches for
+	// (ConfirmedTableLocation); a commit that would move the table elsewhere,
+	// a set-location update or a base whose location field was rewritten, is
+	// refused here too, so a committer that does not run the fork's own check
+	// (a REST client) cannot change it. A row with no recorded location holds
+	// nothing (caver-go#9633).
+	if current != nil {
+		confirmed, ok, err := c.ConfirmedTableLocation(ctx, ident)
+		if err != nil {
+			return nil, "", err
+		}
+		if ok && !sameLocation(staged.Metadata().Location(), confirmed) {
+			return nil, "", fmt.Errorf("%w: the commit names location %q, this catalog recorded %q", table.ErrConfirmedLocationRefused, staged.Metadata().Location(), confirmed)
+		}
+	}
+
 	// Write through the staged table's own FileIO (built from the CATALOG properties,
 	// like CreateTable above), not a FileIO built from table properties: only the
 	// catalog properties carry the warehouse, and with relative paths or snapshot
@@ -498,6 +679,9 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 		if err := c.checkMetadataDirFree(ctx, c.db, strings.Join(ns, "."), tblName, staged.MetadataLocation()); err != nil {
 			return nil, "", err
 		}
+		if err := c.checkLocationFree(ctx, c.db, strings.Join(ns, "."), tblName, staged.Metadata().Location()); err != nil {
+			return nil, "", err
+		}
 	}
 	compression := staged.Properties().Get(table.MetadataCompressionKey, table.MetadataCompressionDefault)
 	if err := internal.WriteTableMetadata(staged.Metadata(), wfs, staged.MetadataLocation(), compression); err != nil {
@@ -517,9 +701,10 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 				IcebergType:              TableType,
 				MetadataLocation:         sql.NullString{Valid: true, String: staged.MetadataLocation()},
 				PreviousMetadataLocation: sql.NullString{Valid: true, String: current.MetadataLocation()},
-			}).WherePK().Where("? = ?", bun.Ident("metadata_location"), current.MetadataLocation()).
-				Where("? = ?", bun.Ident("iceberg_type"), TableType).
-				Exec(ctx)
+			}).ExcludeColumn("location"). // the location a create recorded stays; a commit never rewrites it
+							WherePK().Where("? = ?", bun.Ident("metadata_location"), current.MetadataLocation()).
+							Where("? = ?", bun.Ident("iceberg_type"), TableType).
+							Exec(ctx)
 			if err != nil {
 				return fmt.Errorf("error updating table information: %w", err)
 			}
@@ -543,6 +728,9 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 		if err := c.checkMetadataDirFree(ctx, tx, strings.Join(ns, "."), tblName, staged.MetadataLocation()); err != nil {
 			return err
 		}
+		if err := c.checkLocationFree(ctx, tx, strings.Join(ns, "."), tblName, staged.Metadata().Location()); err != nil {
+			return err
+		}
 		if testhooks.CreateChecked != nil {
 			testhooks.CreateChecked(ctx)
 		}
@@ -552,6 +740,7 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 			TableName:        tblName,
 			IcebergType:      TableType,
 			MetadataLocation: sql.NullString{Valid: true, String: staged.MetadataLocation()},
+			Location:         sql.NullString{Valid: true, String: staged.Metadata().Location()},
 		}).Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
