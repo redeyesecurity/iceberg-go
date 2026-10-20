@@ -21,6 +21,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/google/uuid"
 	"maps"
 	"math/rand/v2"
 	"os"
@@ -522,6 +523,59 @@ func (s *SqliteCatalogTestSuite) TestCreateTableWithGivenLocation() {
 		s.FileExists(strings.TrimPrefix(tbl.MetadataLocation(), "file://"))
 		s.Equal(location, tbl.Location())
 		s.NoError(tt.cat.DropTable(context.Background(), tt.tblID))
+	}
+}
+
+// A create whose first metadata file would sit in another table's metadata
+// directory is refused (caver-go#9633 residual 2): through CreateTable with the
+// location as stored, with the location spelled without its file:// scheme, and
+// through a create by commit (AssertCreate plus set-location), which places its
+// first metadata file the same way. A create of a table that does not exist on a
+// free location still lands.
+func (s *SqliteCatalogTestSuite) TestCreateTableOnAnotherTablesLocationIsRefused() {
+	ctx := context.Background()
+	for _, cat := range []*sqlcat.Catalog{s.getCatalogMemory(), s.getCatalogSqlite()} {
+		first := s.randomTableIdentifier()
+		ns := catalog.NamespaceFromIdent(first)
+		s.Require().NoError(cat.CreateNamespace(ctx, ns, nil))
+		tbl, err := cat.CreateTable(ctx, first, tableSchemaNested)
+		s.Require().NoError(err)
+		s.Require().True(strings.HasPrefix(tbl.Location(), "file://"), "premise: the stored location carries the file:// scheme: %s", tbl.Location())
+
+		second := table.Identifier{ns[0], "second_" + catalog.TableNameFromIdent(first)}
+		_, err = cat.CreateTable(ctx, second, tableSchemaNested, catalog.WithLocation(tbl.Location()))
+		s.ErrorIs(err, catalog.ErrTableAlreadyExists, "CreateTable onto the stored spelling")
+
+		_, err = cat.CreateTable(ctx, second, tableSchemaNested, catalog.WithLocation(strings.TrimPrefix(tbl.Location(), "file://")))
+		s.ErrorIs(err, catalog.ErrTableAlreadyExists, "CreateTable onto the scheme-less spelling")
+
+		third := table.Identifier{ns[0], "third_" + catalog.TableNameFromIdent(first)}
+		_, _, err = cat.CommitTable(ctx, third,
+			[]table.Requirement{table.AssertCreate()},
+			[]table.Update{
+				table.NewAssignUUIDUpdate(uuid.New()),
+				table.NewUpgradeFormatVersionUpdate(2),
+				table.NewAddSchemaUpdate(tableSchemaNested),
+				table.NewSetCurrentSchemaUpdate(-1),
+				table.NewSetLocationUpdate(tbl.Location()),
+			})
+		s.ErrorIs(err, catalog.ErrTableAlreadyExists, "create by commit onto another table's location")
+		_, err = cat.LoadTable(ctx, third)
+		s.ErrorIs(err, catalog.ErrNoSuchTable, "the refused create by commit left no table behind")
+
+		// Control: a create by commit on its own location lands.
+		_, _, err = cat.CommitTable(ctx, third,
+			[]table.Requirement{table.AssertCreate()},
+			[]table.Update{
+				table.NewAssignUUIDUpdate(uuid.New()),
+				table.NewUpgradeFormatVersionUpdate(2),
+				table.NewAddSchemaUpdate(tableSchemaNested),
+				table.NewSetCurrentSchemaUpdate(-1),
+				table.NewSetLocationUpdate(tbl.Location() + "_third"),
+			})
+		s.NoError(err, "control: a create by commit on a free location")
+		s.NoError(cat.DropTable(ctx, third))
+		s.NoError(cat.DropTable(ctx, first))
 	}
 }
 
