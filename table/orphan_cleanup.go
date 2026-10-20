@@ -257,6 +257,20 @@ func (t Table) executeOrphanCleanup(ctx context.Context, cfg *orphanCleanupConfi
 	// that agrees with a shared or warehouse-rooted metadata directory, or a
 	// caller-named root outside the table, never widens what a delete reaches
 	// (caver-go#9633).
+	// A catalog that confirms the table's location (caver-go#9633, option A):
+	// the metadata must agree with it and the root scanned, anchored or
+	// caller-named, must be under it.
+	if confirmed, ok, cerr := t.confirmedLocation(ctx); cerr != nil {
+		return OrphanCleanupResult{}, cerr
+	} else if ok {
+		base := iceio.PathBaseOf(fs)
+		if err := CheckConfirmedLocation(base, t.metadata, confirmed); err != nil {
+			return OrphanCleanupResult{}, err
+		}
+		if !storageDirUnder(iceio.JoinBase(base, scanLocation), iceio.JoinBase(base, confirmed)) {
+			return OrphanCleanupResult{}, fmt.Errorf("%w: scan root %q is outside the confirmed location %q", ErrConfirmedLocationRefused, scanLocation, confirmed)
+		}
+	}
 	if t.strictLayout {
 		base := iceio.PathBaseOf(fs)
 		if err := CheckStrictLayout(base, t.metadata, t.metadataLocation); err != nil {
