@@ -84,6 +84,7 @@ func TestSQLServerCatalogCreate(t *testing.T) {
 			t.Run("create_and_refuse", func(t *testing.T) { serverCreateAndRefuse(t, sc, warehouse) })
 			t.Run("concurrent_creates_land_once", func(t *testing.T) { serverConcurrentCreates(t, sc, warehouse, eng.dialect) })
 			t.Run("held_creates_land_once", func(t *testing.T) { serverHeldCreates(t, sc, warehouse, eng.dialect) })
+			t.Run("update_namespace_properties", func(t *testing.T) { serverUpdateNamespaceProperties(t, sc) })
 		})
 	}
 }
@@ -152,6 +153,33 @@ func serverCreateAndRefuse(t *testing.T, cat *sqlcat.Catalog, warehouse string) 
 			t.Errorf("drop %v: %v", id, err)
 		}
 	}
+}
+
+// UpdateNamespaceProperties overwrites, adds and removes in one call. Before
+// caver-go#9682 it failed on Oracle, whose bun dialect claims ON CONFLICT.
+func serverUpdateNamespaceProperties(t *testing.T, cat *sqlcat.Catalog) {
+	ctx := context.Background()
+	ns := table.Identifier{databaseName()}
+	require.NoError(t, cat.CreateNamespace(ctx, ns, iceberg.Properties{"keep": "a", "change": "b", "drop": "c"}))
+	t.Cleanup(func() { _ = cat.DropNamespace(ctx, ns) })
+
+	summary, err := cat.UpdateNamespaceProperties(ctx, ns, []string{"drop"}, iceberg.Properties{"change": "B", "add": "d"})
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"drop"}, summary.Removed)
+	assert.ElementsMatch(t, []string{"change", "add"}, summary.Updated)
+
+	props, err := cat.LoadNamespaceProperties(ctx, ns)
+	require.NoError(t, err)
+	assert.Equal(t, "a", props["keep"])
+	assert.Equal(t, "B", props["change"], "an existing key is overwritten, not duplicated")
+	assert.Equal(t, "d", props["add"])
+	assert.NotContains(t, props, "drop")
+
+	_, err = cat.UpdateNamespaceProperties(ctx, ns, nil, iceberg.Properties{"change": "C"})
+	require.NoError(t, err, "a second update of the same key")
+	props, err = cat.LoadNamespaceProperties(ctx, ns)
+	require.NoError(t, err)
+	assert.Equal(t, "C", props["change"])
 }
 
 // Concurrent creates onto one location land exactly once. On Oracle every loser

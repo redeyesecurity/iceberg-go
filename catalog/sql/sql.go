@@ -971,9 +971,14 @@ func (c *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table
 				})
 			}
 
+			// bun's oracledialect claims InsertOnConflict, but Oracle has no
+			// ON CONFLICT clause (ORA-03049), so Oracle takes the delete then
+			// insert path, inside the same write transaction (caver-go#9682).
+			onConflict := c.db.HasFeature(feature.InsertOnConflict) && c.db.Dialect().Name() != dialect.Oracle
+
 			q := tx.NewInsert().Model(&props)
 			switch {
-			case c.db.HasFeature(feature.InsertOnConflict):
+			case onConflict:
 				q = q.On("CONFLICT (catalog_name, namespace, property_key) DO UPDATE").
 					Set("property_value = EXCLUDED.property_value")
 			case c.db.HasFeature(feature.InsertOnDuplicateKey):
