@@ -19,6 +19,8 @@ package table
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/apache/iceberg-go"
@@ -97,4 +99,55 @@ func TestAnHonestCommitIsNotObserved9632(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, cat.errs)
 	assert.Equal(t, 1, f.cat.commits)
+}
+
+// failingCatalog is an observingCatalog whose CommitTable fails every attempt
+// with err, as a catalog that answers 5xx or refuses the commit itself does.
+type failingCatalog struct {
+	*observingCatalog
+	err error
+}
+
+func (c *failingCatalog) CommitTable(context.Context, Identifier, []Requirement, []Update) (Metadata, string, error) {
+	c.attempts++
+
+	return nil, "", c.err
+}
+
+// A commit CommitTable fails reaches the catalog, so the observer hears
+// nothing of it, whatever the error (caver-go#9654). That holds for an
+// unknown-state error, for a catalog-side refusal that wraps
+// ErrMetadataWriteRefused (an observer counting both would count it twice),
+// and for a lost race with no retry left.
+func TestACommitTableErrorIsNotObserved9654(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err   error
+		props iceberg.Properties
+	}{
+		"unknown state": {err: errors.New("catalog answered 503")},
+		"catalog-side refusal": {
+			err: fmt.Errorf("catalog belt: %w", ErrMetadataWriteRefused),
+		},
+		"lost race, retries exhausted": {
+			err: fmt.Errorf("pointer race: %w", ErrCommitFailed),
+			props: iceberg.Properties{
+				CommitNumRetriesKey:     "1",
+				CommitMinRetryWaitMsKey: "1",
+				CommitMaxRetryWaitMsKey: "2",
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newAnchorFixture(t, tc.props)
+			obs := &observingCatalog{placingCatalog: f.cat}
+			cat := &failingCatalog{observingCatalog: obs, err: tc.err}
+			tbl := New(Identifier{"db", "t"}, f.cat.metadata, f.cat.location,
+				func(context.Context) (iceio.IO, error) { return &removeRecordingIO{}, nil }, cat)
+
+			_, err := tbl.doCommit(t.Context(), nil, nil)
+			require.ErrorIs(t, err, tc.err)
+			assert.Positive(t, f.cat.attempts, "the commit reached CommitTable")
+			assert.Empty(t, obs.errs, "a commit the catalog saw is not observed")
+		})
+	}
 }
