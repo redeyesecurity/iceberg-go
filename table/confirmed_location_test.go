@@ -86,6 +86,8 @@ func TestCheckConfirmedLocation9633(t *testing.T) {
 		{"empty confirmed location passes", "", "/w/hot", "", nil, true},
 
 		{"location moved to another table", "", "/w/hot", "/w/t", nil, false},
+		{"location moved, both placements pointed back home", "", "/w/hot", "/w/t",
+			iceberg.Properties{WriteDataPathKey: "/w/t/data", WriteMetadataPathKey: "/w/t/metadata"}, false},
 		{"location moved to the warehouse root", "", "/w", "/w/t", nil, false},
 		{"location moved to a prefix sibling", "", "/w/t2", "/w/t", nil, false},
 		{"empty location", "", "", "/w/t", nil, false},
@@ -146,6 +148,19 @@ func TestConfirmedLocationCommit9633(t *testing.T) {
 		assert.Zero(t, f.cat.attempts, "refused before CommitTable")
 		require.Len(t, cat.seen, 1, "the catalog is told once")
 		assert.ErrorIs(t, cat.seen[0], ErrConfirmedLocationRefused)
+	})
+
+	t.Run("the location moved with both placements pointed home is still refused", func(t *testing.T) {
+		// Nothing lands outside the confirmed location, but the location field
+		// itself names the victim, and readers scope on that field.
+		f := newAnchorFixture(t, nil)
+		f.plantInPlace(t, f.wh+"/hot")
+		f.withProps(t, iceberg.Properties{WriteDataPathKey: f.loc + "/data", WriteMetadataPathKey: f.loc + "/metadata"})
+		cat := &confirmingCatalog{placingCatalog: f.cat, loc: f.loc, ok: true}
+		_, err := f.commitVia(t, cat)
+		require.ErrorIs(t, err, ErrConfirmedLocationRefused)
+		assert.Contains(t, err.Error(), "names location")
+		assert.Zero(t, f.cat.attempts)
 	})
 
 	t.Run("residual 1: write.data.path on the victim with the location home", func(t *testing.T) {
