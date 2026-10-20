@@ -265,8 +265,12 @@ func (c *Catalog) namespaceExists(ctx context.Context, ns string) (bool, error) 
 }
 
 // checkMetadataDirFree refuses a create whose first metadata file would sit
-// in the directory of a metadata file this catalog already points at.
-func (c *Catalog) checkMetadataDirFree(ctx context.Context, newMetadataLoc string) error {
+// in the directory of a metadata file this catalog already points at for a
+// DIFFERENT table (caver-go#9633). The same identifier is left out: a create
+// of a table that already exists reaches the insert and fails there with the
+// duplicate-table error callers have always seen, so this check only ever
+// speaks for another table's directory.
+func (c *Catalog) checkMetadataDirFree(ctx context.Context, ns, tbl, newMetadataLoc string) error {
 	i := strings.LastIndexByte(newMetadataLoc, '/')
 	if i < 0 {
 		return nil
@@ -276,6 +280,7 @@ func (c *Catalog) checkMetadataDirFree(ctx context.Context, newMetadataLoc strin
 	taken, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (bool, error) {
 		return tx.NewSelect().Model((*sqlIcebergTable)(nil)).
 			Where("catalog_name = ?", c.name).
+			Where("NOT (table_namespace = ? AND table_name = ?)", ns, tbl).
 			Where("metadata_location LIKE ? ESCAPE '\\'", prefix).
 			Limit(1).Exists(ctx)
 	})
@@ -328,7 +333,7 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 
 	// A location that already holds a table would put this table's first
 	// metadata file into that table's metadata directory (caver-go#9633).
-	if err := c.checkMetadataDirFree(ctx, staged.MetadataLocation()); err != nil {
+	if err := c.checkMetadataDirFree(ctx, ns, tblIdent, staged.MetadataLocation()); err != nil {
 		return nil, err
 	}
 

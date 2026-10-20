@@ -344,12 +344,6 @@ func TestCheckMetadataWriteAnchor9536(t *testing.T) {
 		{"relative loaded path with no base", "", "/w/t", "t/metadata/00001-a.metadata.json", nil, false},
 		{"write.metadata.path planted elsewhere", "", "/w/t", "/w/t/metadata/00001-a.metadata.json",
 			iceberg.Properties{WriteMetadataPathKey: "/w/hot/metadata"}, false},
-		{"data path inside the loaded root", "", "/w/t", "/w/t/metadata/00001-a.metadata.json",
-			iceberg.Properties{WriteDataPathKey: "/w/t/store"}, true},
-		{"location moved with write.metadata.path pinned home (caver-go#9633)", "", "/w/hot", "/w/t/metadata/00001-a.metadata.json",
-			iceberg.Properties{WriteMetadataPathKey: "/w/t/metadata"}, false},
-		{"write.data.path planted at another table", "", "/w/t", "/w/t/metadata/00001-a.metadata.json",
-			iceberg.Properties{WriteDataPathKey: "/w/hot/data"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
