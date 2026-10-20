@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"iter"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -36,6 +37,7 @@ import (
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/view"
 	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect"
 	"github.com/uptrace/bun/dialect/feature"
 	"github.com/uptrace/bun/dialect/mssqldialect"
 	"github.com/uptrace/bun/dialect/mysqldialect"
@@ -153,8 +155,17 @@ type sqlIcebergNamespaceProps struct {
 	PropertyValue sql.NullString
 }
 
+// withReadTx runs fn in a read-only transaction where the driver offers one.
+// The SQL Server and Oracle drivers (go-mssqldb, go-ora) refuse a read-only
+// transaction outright, so on those dialects the read runs in an ordinary one;
+// before caver-go#9678 every namespace and table lookup failed there.
 func withReadTx[R any](ctx context.Context, db *bun.DB, fn func(context.Context, bun.Tx) (R, error)) (result R, err error) {
-	err = db.RunInTx(ctx, &sql.TxOptions{ReadOnly: true}, func(ctx context.Context, tx bun.Tx) error {
+	readOnly := true
+	switch db.Dialect().Name() {
+	case dialect.MSSQL, dialect.Oracle:
+		readOnly = false
+	}
+	err = db.RunInTx(ctx, &sql.TxOptions{ReadOnly: readOnly}, func(ctx context.Context, tx bun.Tx) error {
 		result, err = fn(ctx, tx)
 
 		return err
@@ -177,10 +188,28 @@ func withWriteTx(ctx context.Context, db *bun.DB, fn func(context.Context, bun.T
 // the check into a locking read whose gap lock deadlocks the second insert, and
 // SQL Server holds a range lock on what the check read. The cost is that two
 // concurrent creates in one catalog can conflict even on different locations,
-// and the loser returns the database's error for the caller to retry. Oracle's
-// serializable level is snapshot isolation, which does not see the conflict, so
-// the window stays open there.
+// and the loser returns the database's error for the caller to retry.
+//
+// Oracle's serializable level is snapshot isolation, which does not see the
+// conflict, so there the transaction runs at Oracle's default, read committed,
+// and first takes an exclusive lock on iceberg_tables (caver-go#9678). go-ora
+// also refuses any isolation level but the default. The
+// second create waits on the lock until the first commits, and its check, a
+// fresh read-committed statement, then sees the first create's row. Serializable
+// would not do: its snapshot is taken at the lock statement, before the wait,
+// and would miss the row. The lock still admits readers and holds only until
+// the create commits.
 func withCreateTx(ctx context.Context, db *bun.DB, fn func(context.Context, bun.Tx) error) error {
+	if db.Dialect().Name() == dialect.Oracle {
+		return db.RunInTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault}, func(ctx context.Context, tx bun.Tx) error {
+			if _, err := tx.NewRaw("LOCK TABLE ? IN EXCLUSIVE MODE", bun.Ident("iceberg_tables")).Exec(ctx); err != nil {
+				return fmt.Errorf("failed to lock the table list for a create: %w", err)
+			}
+
+			return fn(ctx, tx)
+		})
+	}
+
 	return db.RunInTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable}, func(ctx context.Context, tx bun.Tx) error {
 		if createTxHook != nil {
 			createTxHook(ctx)
@@ -196,6 +225,12 @@ func withCreateTx(ctx context.Context, db *bun.DB, fn func(context.Context, bun.
 // location, which is the only way to reach the in-transaction check with a row
 // the early check could not have seen (caver-go#9666). Nil in production.
 var createTxHook func(context.Context)
+
+// createCheckedHook, when a test sets it, runs inside a create's transaction
+// after the held-directory check passed and before the insert. A test holds two
+// creates there to prove the second one cannot pass the check while the first
+// is still uncommitted (caver-go#9678).
+var createCheckedHook func(context.Context)
 
 type Catalog struct {
 	db    *bun.DB
@@ -244,16 +279,27 @@ func (c *Catalog) CatalogType() catalog.Type {
 }
 
 func (c *Catalog) CreateSQLTables(ctx context.Context) error {
-	_, err := c.db.NewCreateTable().Model((*sqlIcebergTable)(nil)).
-		IfNotExists().Exec(ctx)
-	if err != nil {
-		return err
+	for _, model := range []any{(*sqlIcebergTable)(nil), (*sqlIcebergNamespaceProps)(nil)} {
+		if c.db.Dialect().Name() == dialect.MSSQL {
+			// SQL Server has no CREATE TABLE IF NOT EXISTS and bun drops the
+			// clause there, so opening a catalog whose tables already existed
+			// failed (caver-go#9678). Ask for the table first instead.
+			var present int
+			err := c.db.NewRaw("SELECT CASE WHEN OBJECT_ID(?, 'U') IS NULL THEN 0 ELSE 1 END",
+				c.db.Table(reflect.TypeOf(model).Elem()).Name).Scan(ctx, &present)
+			if err != nil {
+				return err
+			}
+			if present == 1 {
+				continue
+			}
+		}
+		if _, err := c.db.NewCreateTable().Model(model).IfNotExists().Exec(ctx); err != nil {
+			return err
+		}
 	}
 
-	_, err = c.db.NewCreateTable().Model((*sqlIcebergNamespaceProps)(nil)).
-		IfNotExists().Exec(ctx)
-
-	return err
+	return nil
 }
 
 func (c *Catalog) DropSQLTables(ctx context.Context) error {
@@ -273,12 +319,15 @@ func (c *Catalog) ensureTablesExist() error {
 	return c.CreateSQLTables(context.Background())
 }
 
+// namespaceExists asks EXISTS without a LIMIT: EXISTS stops at the first row
+// anyway, and Oracle has no LIMIT clause, which bun renders for it as written
+// (caver-go#9678).
 func (c *Catalog) namespaceExists(ctx context.Context, ns string) (bool, error) {
 	return withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (bool, error) {
 		exists, err := tx.NewSelect().Model((*sqlIcebergTable)(nil)).
-			Where("catalog_name = ?", c.name).
-			Where("table_namespace = ?", ns).
-			Limit(1).Exists(ctx)
+			Where("? = ?", bun.Ident("catalog_name"), c.name).
+			Where("? = ?", bun.Ident("table_namespace"), ns).
+			Exists(ctx)
 		if err != nil {
 			return false, err
 		}
@@ -287,8 +336,8 @@ func (c *Catalog) namespaceExists(ctx context.Context, ns string) (bool, error) 
 		}
 
 		return tx.NewSelect().Model((*sqlIcebergNamespaceProps)(nil)).
-			Where("catalog_name = ?", c.name).Where("namespace = ?", ns).
-			Limit(1).Exists(ctx)
+			Where("? = ?", bun.Ident("catalog_name"), c.name).Where("? = ?", bun.Ident("namespace"), ns).
+			Exists(ctx)
 	})
 }
 
@@ -329,9 +378,9 @@ func (c *Catalog) checkMetadataDirFree(ctx context.Context, db bun.IDB, ns, tbl,
 	var locs []string
 	err := db.NewSelect().Model((*sqlIcebergTable)(nil)).
 		Column("metadata_location").
-		Where("catalog_name = ?", c.name).
-		Where("NOT (table_namespace = ? AND table_name = ?)", ns, tbl).
-		Where("metadata_location IS NOT NULL").
+		Where("? = ?", bun.Ident("catalog_name"), c.name).
+		Where("NOT (? = ? AND ? = ?)", bun.Ident("table_namespace"), ns, bun.Ident("table_name"), tbl).
+		Where("? IS NOT NULL", bun.Ident("metadata_location")).
 		Scan(ctx, &locs)
 	if err != nil {
 		return err
@@ -397,6 +446,9 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 	err = withCreateTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
 		if err := c.checkMetadataDirFree(ctx, tx, ns, tblIdent, staged.MetadataLocation()); err != nil {
 			return err
+		}
+		if createCheckedHook != nil {
+			createCheckedHook(ctx)
 		}
 		_, err := tx.NewInsert().Model(&sqlIcebergTable{
 			CatalogName:      c.name,
@@ -477,8 +529,8 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 				IcebergType:              TableType,
 				MetadataLocation:         sql.NullString{Valid: true, String: staged.MetadataLocation()},
 				PreviousMetadataLocation: sql.NullString{Valid: true, String: current.MetadataLocation()},
-			}).WherePK().Where("metadata_location = ?", current.MetadataLocation()).
-				Where("iceberg_type = ?", TableType).
+			}).WherePK().Where("? = ?", bun.Ident("metadata_location"), current.MetadataLocation()).
+				Where("? = ?", bun.Ident("iceberg_type"), TableType).
 				Exec(ctx)
 			if err != nil {
 				return fmt.Errorf("error updating table information: %w", err)
@@ -502,6 +554,9 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 
 		if err := c.checkMetadataDirFree(ctx, tx, strings.Join(ns, "."), tblName, staged.MetadataLocation()); err != nil {
 			return err
+		}
+		if createCheckedHook != nil {
+			createCheckedHook(ctx)
 		}
 		_, err := tx.NewInsert().Model(&sqlIcebergTable{
 			CatalogName:      c.name,
@@ -530,9 +585,9 @@ func (c *Catalog) LoadTable(ctx context.Context, identifier table.Identifier) (*
 	result, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (*sqlIcebergTable, error) {
 		t := new(sqlIcebergTable)
 		err := tx.NewSelect().Model(t).
-			Where("catalog_name = ?", c.name).
-			Where("table_namespace = ?", strings.Join(ns, ".")).
-			Where("table_name = ?", tbl).
+			Where("? = ?", bun.Ident("catalog_name"), c.name).
+			Where("? = ?", bun.Ident("table_namespace"), strings.Join(ns, ".")).
+			Where("? = ?", bun.Ident("table_name"), tbl).
 			Scan(ctx)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchTable, identifier)
@@ -570,7 +625,7 @@ func (c *Catalog) DropTable(ctx context.Context, identifier table.Identifier) er
 			CatalogName:    c.name,
 			TableNamespace: ns,
 			TableName:      tbl,
-		}).WherePK().Where("iceberg_type = ?", TableType).Exec(ctx)
+		}).WherePK().Where("? = ?", bun.Ident("iceberg_type"), TableType).Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to delete table entry: %w", err)
 		}
@@ -621,9 +676,9 @@ func (c *Catalog) RenameTable(ctx context.Context, from, to table.Identifier) (*
 			CatalogName:    c.name,
 			TableNamespace: fromNs,
 			TableName:      fromTbl,
-		}).WherePK().Where("iceberg_type = ?", TableType).
-			Set("table_namespace = ?", toNs).
-			Set("table_name = ?", toTbl).
+		}).WherePK().Where("? = ?", bun.Ident("iceberg_type"), TableType).
+			Set("? = ?", bun.Ident("table_namespace"), toNs).
+			Set("? = ?", bun.Ident("table_name"), toTbl).
 			Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("error renaming table from '%s' to %s': %w", from, to, err)
@@ -734,8 +789,8 @@ func (c *Catalog) DropNamespace(ctx context.Context, namespace table.Identifier)
 
 	return withWriteTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
 		_, err := tx.NewDelete().Model((*sqlIcebergNamespaceProps)(nil)).
-			Where("catalog_name = ?", c.name).
-			Where("namespace = ?", nsToDelete).Exec(ctx)
+			Where("? = ?", bun.Ident("catalog_name"), c.name).
+			Where("? = ?", bun.Ident("namespace"), nsToDelete).Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("error deleting namespace '%s': %w", namespace, err)
 		}
@@ -762,8 +817,8 @@ func (c *Catalog) LoadNamespaceProperties(ctx context.Context, namespace table.I
 	return withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (iceberg.Properties, error) {
 		var props []sqlIcebergNamespaceProps
 		err := tx.NewSelect().Model(&props).
-			Where("catalog_name = ?", c.name).
-			Where("namespace = ?", nsToLoad).Scan(ctx)
+			Where("? = ?", bun.Ident("catalog_name"), c.name).
+			Where("? = ?", bun.Ident("namespace"), nsToLoad).Scan(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("error loading namespace properties for '%s': %w", namespace, err)
 		}
@@ -809,9 +864,9 @@ func (c *Catalog) listTablesAll(ctx context.Context, namespace table.Identifier)
 	tables, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) ([]sqlIcebergTable, error) {
 		var tables []sqlIcebergTable
 		err := tx.NewSelect().Model(&tables).
-			Where("catalog_name = ?", c.name).
-			Where("table_namespace = ?", ns).
-			Where("iceberg_type = ?", TableType).
+			Where("? = ?", bun.Ident("catalog_name"), c.name).
+			Where("? = ?", bun.Ident("table_namespace"), ns).
+			Where("? = ?", bun.Ident("iceberg_type"), TableType).
 			Scan(ctx)
 
 		return tables, err
@@ -830,9 +885,9 @@ func (c *Catalog) listTablesAll(ctx context.Context, namespace table.Identifier)
 
 func (c *Catalog) ListNamespaces(ctx context.Context, parent table.Identifier) ([]table.Identifier, error) {
 	tableQuery := c.db.NewSelect().Model((*sqlIcebergTable)(nil)).
-		Column("table_namespace").Where("catalog_name = ?", c.name)
+		Column("table_namespace").Where("? = ?", bun.Ident("catalog_name"), c.name)
 	nsQuery := c.db.NewSelect().Model((*sqlIcebergNamespaceProps)(nil)).
-		Column("namespace").Where("catalog_name = ?", c.name)
+		Column("namespace").Where("? = ?", bun.Ident("catalog_name"), c.name)
 
 	if len(parent) > 0 {
 		ns := strings.Join(parent, ".")
@@ -845,8 +900,8 @@ func (c *Catalog) ListNamespaces(ctx context.Context, parent table.Identifier) (
 		}
 
 		ns += "%"
-		tableQuery = tableQuery.Where("table_namespace like ?", ns)
-		nsQuery = nsQuery.Where("namespace like ?", ns)
+		tableQuery = tableQuery.Where("? like ?", bun.Ident("table_namespace"), ns)
+		nsQuery = nsQuery.Where("? like ?", bun.Ident("namespace"), ns)
 	}
 
 	namespaces, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) ([]string, error) {
@@ -897,9 +952,9 @@ func (c *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table
 		var m *sqlIcebergNamespaceProps
 		if len(removals) > 0 {
 			_, err := tx.NewDelete().Model(m).
-				Where("catalog_name = ?", c.name).
-				Where("namespace = ?", nsToUpdate).
-				Where("property_key in (?)", bun.List(removals)).Exec(ctx)
+				Where("? = ?", bun.Ident("catalog_name"), c.name).
+				Where("? = ?", bun.Ident("namespace"), nsToUpdate).
+				Where("? in (?)", bun.Ident("property_key"), bun.List(removals)).Exec(ctx)
 			if err != nil {
 				return fmt.Errorf("error deleting properties for '%s': %w", namespace, err)
 			}
@@ -925,9 +980,9 @@ func (c *Catalog) UpdateNamespaceProperties(ctx context.Context, namespace table
 				q = q.On("DUPLICATE KEY UPDATE")
 			default:
 				_, err := tx.NewDelete().Model(m).
-					Where("catalog_name = ?", c.name).
-					Where("namespace = ?", nsToUpdate).
-					Where("property_key in (?)", bun.List(slices.Collect(maps.Keys(updates)))).
+					Where("? = ?", bun.Ident("catalog_name"), c.name).
+					Where("? = ?", bun.Ident("namespace"), nsToUpdate).
+					Where("? in (?)", bun.Ident("property_key"), bun.List(slices.Collect(maps.Keys(updates)))).
 					Exec(ctx)
 				if err != nil {
 					return fmt.Errorf("error deleting properties for '%s': %w", namespace, err)
@@ -1032,9 +1087,9 @@ func (c *Catalog) listViewsAll(ctx context.Context, namespace table.Identifier) 
 	views, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) ([]sqlIcebergTable, error) {
 		var views []sqlIcebergTable
 		err := tx.NewSelect().Model(&views).
-			Where("catalog_name = ?", c.name).
-			Where("table_namespace = ?", ns).
-			Where("iceberg_type = ?", ViewType).
+			Where("? = ?", bun.Ident("catalog_name"), c.name).
+			Where("? = ?", bun.Ident("table_namespace"), ns).
+			Where("? = ?", bun.Ident("iceberg_type"), ViewType).
 			Scan(ctx)
 
 		return views, err
@@ -1060,10 +1115,10 @@ func (c *Catalog) DropView(ctx context.Context, identifier table.Identifier) err
 	view, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (*sqlIcebergTable, error) {
 		v := new(sqlIcebergTable)
 		err := tx.NewSelect().Model(v).
-			Where("catalog_name = ?", c.name).
-			Where("table_namespace = ?", ns).
-			Where("table_name = ?", viewName).
-			Where("iceberg_type = ?", ViewType).
+			Where("? = ?", bun.Ident("catalog_name"), c.name).
+			Where("? = ?", bun.Ident("table_namespace"), ns).
+			Where("? = ?", bun.Ident("table_name"), viewName).
+			Where("? = ?", bun.Ident("iceberg_type"), ViewType).
 			Scan(ctx)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchView, identifier)
@@ -1087,7 +1142,7 @@ func (c *Catalog) DropView(ctx context.Context, identifier table.Identifier) err
 			CatalogName:    c.name,
 			TableNamespace: ns,
 			TableName:      viewName,
-		}).WherePK().Where("iceberg_type = ?", ViewType).Exec(ctx)
+		}).WherePK().Where("? = ?", bun.Ident("iceberg_type"), ViewType).Exec(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to delete view entry: %w", err)
 		}
@@ -1129,7 +1184,7 @@ func (c *Catalog) CheckViewExists(ctx context.Context, identifier table.Identifi
 			CatalogName:    c.name,
 			TableNamespace: ns,
 			TableName:      viewName,
-		}).WherePK().Where("iceberg_type = ?", ViewType).Exists(ctx)
+		}).WherePK().Where("? = ?", bun.Ident("iceberg_type"), ViewType).Exists(ctx)
 		if err != nil {
 			return false, fmt.Errorf("error checking view existence: %w", err)
 		}
@@ -1146,10 +1201,10 @@ func (c *Catalog) LoadView(ctx context.Context, identifier table.Identifier) (vi
 	v, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (*sqlIcebergTable, error) {
 		v := new(sqlIcebergTable)
 		err := tx.NewSelect().Model(v).
-			Where("catalog_name = ?", c.name).
-			Where("table_namespace = ?", ns).
-			Where("table_name = ?", viewName).
-			Where("iceberg_type = ?", ViewType).
+			Where("? = ?", bun.Ident("catalog_name"), c.name).
+			Where("? = ?", bun.Ident("table_namespace"), ns).
+			Where("? = ?", bun.Ident("table_name"), viewName).
+			Where("? = ?", bun.Ident("iceberg_type"), ViewType).
 			Scan(ctx)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("%w: %s", catalog.ErrNoSuchView, identifier)

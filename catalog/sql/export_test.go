@@ -26,3 +26,12 @@ func SetCreateTxHook(fn func(context.Context)) (restore func()) {
 
 	return func() { createTxHook = nil }
 }
+
+// SetCreateCheckedHook installs fn as the hook a create runs between its
+// in-transaction held-directory check and its insert, and returns a func that
+// removes it.
+func SetCreateCheckedHook(fn func(context.Context)) (restore func()) {
+	createCheckedHook = fn
+
+	return func() { createCheckedHook = nil }
+}
