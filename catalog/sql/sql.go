@@ -169,6 +169,34 @@ func withWriteTx(ctx context.Context, db *bun.DB, fn func(context.Context, bun.T
 	})
 }
 
+// withCreateTx runs a create's held-directory check and its insert in one
+// serializable transaction (caver-go#9666). Run apart, or together at the
+// default level, two concurrent creates onto one location each miss the other's
+// uncommitted row and both land. Serializable makes one of them fail instead:
+// SQLite admits one writer, Postgres aborts a serialization conflict, MySQL turns
+// the check into a locking read whose gap lock deadlocks the second insert, and
+// SQL Server holds a range lock on what the check read. The cost is that two
+// concurrent creates in one catalog can conflict even on different locations,
+// and the loser returns the database's error for the caller to retry. Oracle's
+// serializable level is snapshot isolation, which does not see the conflict, so
+// the window stays open there.
+func withCreateTx(ctx context.Context, db *bun.DB, fn func(context.Context, bun.Tx) error) error {
+	return db.RunInTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable}, func(ctx context.Context, tx bun.Tx) error {
+		if createTxHook != nil {
+			createTxHook(ctx)
+		}
+
+		return fn(ctx, tx)
+	})
+}
+
+// createTxHook, when a test sets it (SetCreateTxHook in export_test.go), runs
+// inside a create's transaction before its held-directory check and insert. It
+// exists so a test can park one create there while a peer lands on the same
+// location, which is the only way to reach the in-transaction check with a row
+// the early check could not have seen (caver-go#9666). Nil in production.
+var createTxHook func(context.Context)
+
 type Catalog struct {
 	db    *bun.DB
 	name  string
@@ -271,13 +299,20 @@ func (c *Catalog) namespaceExists(ctx context.Context, ns string) (bool, error) 
 // duplicate-table error callers have always seen, so this check only ever speaks
 // for another table's directory.
 //
-// The directory is compared as a string prefix with SUBSTR, which every dialect
-// this catalog runs on (sqlite, postgres, mysql) spells the same way; LIKE would
-// need an ESCAPE clause, and MySQL does not accept a backslash there. Both
-// spellings of a local path are asked for, with and without the file:// scheme,
-// because a row stored as file:///w/t and a create spelled /w/t name one
-// directory. Other schemes are compared as written.
-func (c *Catalog) checkMetadataDirFree(ctx context.Context, ns, tbl, newMetadataLoc string) error {
+// The directory is compared as a byte prefix in Go, not in SQL (caver-go#9666):
+// the dialects do not share a substring function (SQL Server has SUBSTRING and no
+// SUBSTR), LIKE would need an ESCAPE clause MySQL does not accept with a
+// backslash, and MySQL's default collation would compare case-insensitively,
+// refusing wh/db.db/CASE beside wh/db.db/case on a case-sensitive store such as
+// S3. The directory keeps its trailing separator, so wh/meta2/ is not inside
+// wh/meta/. Both spellings of a local path are asked for, with and without the
+// file:// scheme, because a row stored as file:///w/t and a create spelled /w/t
+// name one directory. Other schemes are compared as written.
+//
+// db is the catalog's handle for the early check, which refuses before any
+// metadata file is written, and the create transaction for the check that holds
+// (see withCreateTx).
+func (c *Catalog) checkMetadataDirFree(ctx context.Context, db bun.IDB, ns, tbl, newMetadataLoc string) error {
 	i := strings.LastIndexByte(newMetadataLoc, '/')
 	if i < 0 {
 		return nil
@@ -291,25 +326,22 @@ func (c *Catalog) checkMetadataDirFree(ctx context.Context, ns, tbl, newMetadata
 		spellings = append(spellings, "file://"+dir)
 	}
 
-	taken, err := withReadTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) (bool, error) {
-		q := tx.NewSelect().Model((*sqlIcebergTable)(nil)).
-			Where("catalog_name = ?", c.name).
-			Where("NOT (table_namespace = ? AND table_name = ?)", ns, tbl)
-		q = q.WhereGroup(" AND ", func(q *bun.SelectQuery) *bun.SelectQuery {
-			for _, sp := range spellings {
-				q = q.WhereOr("SUBSTR(metadata_location, 1, ?) = ?", len(sp), sp)
-			}
-
-			return q
-		})
-
-		return q.Limit(1).Exists(ctx)
-	})
+	var locs []string
+	err := db.NewSelect().Model((*sqlIcebergTable)(nil)).
+		Column("metadata_location").
+		Where("catalog_name = ?", c.name).
+		Where("NOT (table_namespace = ? AND table_name = ?)", ns, tbl).
+		Where("metadata_location IS NOT NULL").
+		Scan(ctx, &locs)
 	if err != nil {
 		return err
 	}
-	if taken {
-		return fmt.Errorf("%w: the location of %q already holds a table", catalog.ErrTableAlreadyExists, newMetadataLoc)
+	for _, loc := range locs {
+		for _, sp := range spellings {
+			if strings.HasPrefix(loc, sp) {
+				return fmt.Errorf("%w: the metadata directory of %q already holds another table's metadata", catalog.ErrTableAlreadyExists, newMetadataLoc)
+			}
+		}
 	}
 
 	return nil
@@ -350,9 +382,10 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 		return nil, errors.New("loaded filesystem IO does not support writing")
 	}
 
-	// A location that already holds a table would put this table's first
-	// metadata file into that table's metadata directory (caver-go#9633).
-	if err := c.checkMetadataDirFree(ctx, ns, tblIdent, staged.MetadataLocation()); err != nil {
+	// Refuse before writing when this table's first metadata file would land in
+	// a metadata directory another table already points at (caver-go#9633). The
+	// insert below checks again, in its own transaction.
+	if err := c.checkMetadataDirFree(ctx, c.db, ns, tblIdent, staged.MetadataLocation()); err != nil {
 		return nil, err
 	}
 
@@ -361,7 +394,10 @@ func (c *Catalog) CreateTable(ctx context.Context, ident table.Identifier, sc *i
 		return nil, err
 	}
 
-	err = withWriteTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
+	err = withCreateTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
+		if err := c.checkMetadataDirFree(ctx, tx, ns, tblIdent, staged.MetadataLocation()); err != nil {
+			return err
+		}
 		_, err := tx.NewInsert().Model(&sqlIcebergTable{
 			CatalogName:      c.name,
 			TableNamespace:   ns,
@@ -417,9 +453,9 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 	// A create by commit (no current table, AssertCreate) places its first
 	// metadata file like CreateTable does, so it is held to the same rule: not
 	// into a directory another table in this catalog already points at
-	// (caver-go#9633).
+	// (caver-go#9633). The insert below checks again, in its own transaction.
 	if current == nil {
-		if err := c.checkMetadataDirFree(ctx, strings.Join(ns, "."), tblName, staged.MetadataLocation()); err != nil {
+		if err := c.checkMetadataDirFree(ctx, c.db, strings.Join(ns, "."), tblName, staged.MetadataLocation()); err != nil {
 			return nil, "", err
 		}
 	}
@@ -428,7 +464,11 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 		return nil, "", err
 	}
 
-	err = withWriteTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
+	runTx := withWriteTx
+	if current == nil {
+		runTx = withCreateTx
+	}
+	err = runTx(ctx, c.db, func(ctx context.Context, tx bun.Tx) error {
 		if current != nil {
 			res, err := tx.NewUpdate().Model(&sqlIcebergTable{
 				CatalogName:              c.name,
@@ -460,6 +500,9 @@ func (c *Catalog) CommitTable(ctx context.Context, ident table.Identifier, reqs 
 			return nil
 		}
 
+		if err := c.checkMetadataDirFree(ctx, tx, strings.Join(ns, "."), tblName, staged.MetadataLocation()); err != nil {
+			return err
+		}
 		_, err := tx.NewInsert().Model(&sqlIcebergTable{
 			CatalogName:      c.name,
 			TableNamespace:   strings.Join(ns, "."),
