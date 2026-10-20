@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -642,16 +643,43 @@ func TestTheOrphanScanReadsManifestsThroughTheHook(t *testing.T) {
 		require.NoError(t, err)
 		requireEveryManifestOpenHooked(t, r, "orphan scan")
 	})
+	// stray is a parquet file under the table that no manifest references: the one
+	// thing an unrefused scan deletes, so "deleted nothing" is a claim that can fail.
+	stray := func(t *testing.T, r *coverageRig) string {
+		t.Helper()
+		p := strings.TrimSuffix(r.tbl.Location(), "/") + "/data/stray-orphan.parquet"
+		r.write(p)
+		past := time.Now().Add(-time.Hour)
+		require.NoError(t, os.Chtimes(strings.TrimPrefix(p, "file://"), past, past))
+
+		return p
+	}
+	t.Run("an unrefused scan deletes the stray (the premise of the next case)", func(t *testing.T) {
+		r := newCoverageRig(t, nil)
+		r.appendOne(t)
+		r.appendOne(t)
+		s := stray(t, r)
+		tbl := scanTable(t, r)
+		var deleted []string
+		_, err := tbl.DeleteOrphanFiles(ctx, WithFilesOlderThan(0),
+			WithDeleteFunc(func(p string) error { deleted = append(deleted, p); return nil }))
+		require.NoError(t, err)
+		require.Contains(t, deleted, s, "the stray was not listed, so the refusal case below could not have deleted it either")
+	})
 	t.Run("a refused manifest aborts the scan with nothing deleted", func(t *testing.T) {
 		r := newCoverageRig(t, nil)
 		r.appendOne(t)
 		r.appendOne(t)
+		s := stray(t, r)
 		tbl := scanTable(t, r)
 		r.hook.refuse = "-m" // every manifest file name is <commit uuid>-m<N>.avro; a uuid has no "-m"
 		var deleted []string
 		_, err := tbl.DeleteOrphanFiles(ctx, WithFilesOlderThan(0),
 			WithDeleteFunc(func(p string) error { deleted = append(deleted, p); return nil }))
 		require.ErrorIs(t, err, errHookRefused)
-		require.Empty(t, deleted, "a refused manifest read must delete nothing")
+		require.Empty(t, deleted, "a refused manifest read must delete nothing, and there was a stray to delete")
+		if _, err := r.raw.Open(s); err != nil {
+			t.Fatalf("the stray is gone after a refused scan: %v", err)
+		}
 	})
 }

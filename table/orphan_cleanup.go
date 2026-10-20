@@ -324,9 +324,12 @@ func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 		referenced[p] = true
 	}
 
-	// The lists and manifests are read through the table's ManifestReadIO, so a
-	// manifest rewritten in place to drop entries (which would make the dropped
-	// files read as orphans) is refused before it is decoded (caver-go#9638).
+	// The lists and manifests are read through the table's ManifestReadIO, the
+	// same hook every commit-path read goes through, so whatever rule the catalog
+	// installed there (path containment, an entry-point decode) is applied to the
+	// scan's reads too. The fork only routes the read; what is refused is the
+	// hook's decision, and a scan whose read is refused lists and deletes nothing
+	// (caver-go#9638).
 	mfs := t.manifestIO(fs)
 	for _, snapshot := range metadata.Snapshots() {
 		if snapshot.ManifestList != "" {
