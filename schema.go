@@ -294,16 +294,17 @@ func (s *Schema) MarshalJSON() ([]byte, error) {
 		ids = []int{}
 	}
 
-	type Alias Schema
-
-	aliasCopy := *(*Alias)(s)
-	aliasCopy.IdentifierFieldIDs = ids
-
+	// The serialised fields are named here rather than borrowed from Schema
+	// through an alias copy: copying the struct by value also copies its
+	// lazily published index pointers (atomic.Pointer fields) with a plain
+	// read, which races with a concurrent lookup publishing them
+	// (caver-go#9669). The key order is the one the alias produced.
 	return json.Marshal(struct {
-		Type   string        `json:"type"`
-		Fields []NestedField `json:"fields"`
-		*Alias
-	}{Type: "struct", Fields: s.fields, Alias: &aliasCopy})
+		Type               string        `json:"type"`
+		Fields             []NestedField `json:"fields"`
+		ID                 int           `json:"schema-id"`
+		IdentifierFieldIDs []int         `json:"identifier-field-ids"`
+	}{Type: "struct", Fields: s.fields, ID: s.ID, IdentifierFieldIDs: ids})
 }
 
 // FindColumnName returns the name of the column identified by the
