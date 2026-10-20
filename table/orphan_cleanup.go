@@ -324,12 +324,19 @@ func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 		referenced[p] = true
 	}
 
+	// The lists and manifests are read through the table's ManifestReadIO, the
+	// same hook every commit-path read goes through, so whatever rule the catalog
+	// installed there (path containment, an entry-point decode) is applied to the
+	// scan's reads too. The fork only routes the read; what is refused is the
+	// hook's decision, and a scan whose read is refused lists and deletes nothing
+	// (caver-go#9638).
+	mfs := t.manifestIO(fs)
 	for _, snapshot := range metadata.Snapshots() {
 		if snapshot.ManifestList != "" {
 			referenced[iceio.JoinBase(iceio.PathBaseOf(fs), snapshot.ManifestList)] = true
 		}
 
-		manifestFiles, err := snapshot.Manifests(fs)
+		manifestFiles, err := snapshot.Manifests(mfs)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read manifests for snapshot %d: %w", snapshot.SnapshotID, err)
 		}
@@ -343,7 +350,7 @@ func (t Table) getReferencedFiles(fs iceio.IO) (map[string]bool, error) {
 			// against orphan cleanup once the snapshot that
 			// originally held it live has been expired.
 			// This matches iceberg-java and pyiceberg behavior.
-			for entry, err := range manifest.Entries(fs, true) {
+			for entry, err := range manifest.Entries(mfs, true) {
 				if err != nil {
 					return nil, fmt.Errorf("failed to read manifest entries: %w", err)
 				}
