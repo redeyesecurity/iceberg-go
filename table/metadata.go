@@ -342,9 +342,11 @@ func (b *MetadataBuilder) AddSchema(schema *iceberg.Schema) error {
 
 	newSchemaID := b.reuseOrCreateNewSchemaID(schema)
 
-	if _, err := b.GetSchemaByID(newSchemaID); err == nil {
+	if existing, err := b.GetSchemaByID(newSchemaID); err == nil {
+		// Record the schema already in the list, which carries the reused
+		// id; the caller's equal schema may name another id.
 		if b.lastAddedSchemaID == nil || *b.lastAddedSchemaID != newSchemaID {
-			b.updates = append(b.updates, NewAddSchemaUpdate(schema))
+			b.updates = append(b.updates, NewAddSchemaUpdate(existing))
 			b.lastAddedSchemaID = &newSchemaID
 		}
 

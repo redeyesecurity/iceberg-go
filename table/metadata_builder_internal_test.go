@@ -1040,6 +1040,27 @@ func TestAddSchemaLeavesCallerSchemaID(t *testing.T) {
 	require.Same(t, stored, update.Schema, "the update carries the schema with the assigned id")
 }
 
+// TestAddSchemaReuseRecordsReusedID pins caver-go#9700: a schema equal to one
+// already in the list reuses that schema's id, and the add-schema update must
+// name the reused id rather than the caller's.
+func TestAddSchemaReuseRecordsReusedID(t *testing.T) {
+	builder := builderWithoutChanges(2)
+	added := schema()
+	added.ID = 7
+
+	require.NoError(t, builder.AddSchema(&added))
+
+	require.Equal(t, 7, added.ID, "the caller's schema keeps its own id")
+	require.Len(t, builder.schemaList, 1)
+	require.NotNil(t, builder.lastAddedSchemaID)
+	require.Equal(t, 0, *builder.lastAddedSchemaID)
+
+	update, ok := builder.updates[len(builder.updates)-1].(*addSchemaUpdate)
+	require.True(t, ok)
+	require.Equal(t, 0, update.Schema.ID, "the update names the reused id")
+	require.Same(t, builder.schemaList[0], update.Schema)
+}
+
 func TestAddIncompatibleCurrentSchemaFails(t *testing.T) {
 	builder := builderWithoutChanges(2)
 	addedSchema := iceberg.NewSchema(1)
