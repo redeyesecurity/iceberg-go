@@ -69,12 +69,20 @@ func (p PartitionField) SourceID() int {
 }
 
 // EscapedName returns the URL-escaped version of the partition field name.
+//
+// The cache is filled when the field's spec is built (PartitionSpec.initialize)
+// and never written afterwards, so concurrent callers, the partition-path
+// formatting on every data-writer goroutine, do not race each other or the
+// by-value copy PartitionField.MarshalJSON makes when a commit serialises the
+// spec (caver-go#9669). A field that was never part of a spec, or was copied
+// out of one before the cache was filled, is escaped on each call and nothing
+// is stored.
 func (p *PartitionField) EscapedName() string {
-	if p.escapedName == "" {
-		p.escapedName = url.QueryEscape(p.Name)
+	if p.escapedName != "" {
+		return p.escapedName
 	}
 
-	return p.escapedName
+	return url.QueryEscape(p.Name)
 }
 
 func (p PartitionField) MarshalJSON() ([]byte, error) {
@@ -415,6 +423,13 @@ func (ps *PartitionSpec) UnmarshalJSON(b []byte) error {
 }
 
 func (ps *PartitionSpec) initialize() {
+	// The escaped names are filled here, once, before the fields are copied into
+	// the by-source index below, so every copy carries the cache and no caller
+	// writes it later (caver-go#9669).
+	for i := range ps.fields {
+		ps.fields[i].escapedName = url.QueryEscape(ps.fields[i].Name)
+	}
+
 	ps.sourceIdToFields = make(map[int][]PartitionField)
 
 	for i := range ps.fields {
