@@ -84,6 +84,7 @@ type Table struct {
 	cat              CatalogIO
 	fsF              FSysF
 	manifestReadIO   ManifestReadIO
+	strictLayout     bool
 }
 
 // ManifestReadIO wraps the FileIO the COMMIT PATH reads manifest lists and manifests
@@ -600,6 +601,19 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 
 			return nil, anchorErr
 		}
+		// A strict-layout table also refuses a base whose data or metadata
+		// placement leaves <location>/data and <location>/metadata, the shape
+		// the write anchor cannot tell from a legitimate split layout
+		// (caver-go#9633). Same terms as the anchor: every attempt, terminal.
+		if t.strictLayout {
+			if layoutErr := CheckStrictLayout(icebergio.PathBaseOf(fs), current, currentLoc); layoutErr != nil {
+				if obs, ok := t.cat.(CommitRefusalObserver); ok {
+					obs.ObserveCommitRefusal(retryCtx, t.identifier, layoutErr)
+				}
+
+				return nil, layoutErr
+			}
+		}
 
 		newMeta, newLoc, err = t.cat.CommitTable(retryCtx, t.identifier, reqs, updates)
 		if err == nil {
@@ -632,6 +646,7 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 
 	committed := New(t.identifier, newMeta, newLoc, t.fsF, t.cat)
 	committed.manifestReadIO = t.manifestReadIO // a caller that chains on the result keeps the hook
+	committed.strictLayout = t.strictLayout
 
 	return committed, nil
 }

@@ -251,6 +251,21 @@ func (t Table) executeOrphanCleanup(ctx context.Context, cfg *orphanCleanupConfi
 			return OrphanCleanupResult{}, err
 		}
 	}
+	// A strict-layout table scans only its own plain layout: the loaded metadata
+	// must sit in <location>/metadata with no property moving files elsewhere,
+	// and an explicit root must be the location itself, so a planted location
+	// that agrees with a shared or warehouse-rooted metadata directory, or a
+	// caller-named root outside the table, never widens what a delete reaches
+	// (caver-go#9633).
+	if t.strictLayout {
+		base := iceio.PathBaseOf(fs)
+		if err := CheckStrictLayout(base, t.metadata, t.metadataLocation); err != nil {
+			return OrphanCleanupResult{}, err
+		}
+		if !sameStorageDir(iceio.JoinBase(base, scanLocation), iceio.JoinBase(base, t.metadata.Location())) {
+			return OrphanCleanupResult{}, fmt.Errorf("%w: scan root %q is not the table location %q", ErrStrictLayoutRefused, scanLocation, t.metadata.Location())
+		}
+	}
 
 	referencedFiles, err := t.getReferencedFiles(fs)
 	if err != nil {
