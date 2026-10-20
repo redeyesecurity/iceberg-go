@@ -614,6 +614,21 @@ func (t Table) doCommit(ctx context.Context, updates []Update, reqs []Requiremen
 				return nil, layoutErr
 			}
 		}
+		// A catalog that confirms the table's location is the second source of
+		// truth the anchor lacks (caver-go#9633, option A): the base must agree
+		// with it. Asked on every attempt, since a retry commits on a refreshed
+		// base; a catalog that cannot be asked ends the commit with its error.
+		if confirmed, ok, cerr := t.confirmedLocation(retryCtx); cerr != nil {
+			return nil, cerr
+		} else if ok {
+			if locErr := CheckConfirmedLocation(icebergio.PathBaseOf(fs), current, confirmed); locErr != nil {
+				if obs, ok := t.cat.(CommitRefusalObserver); ok {
+					obs.ObserveCommitRefusal(retryCtx, t.identifier, locErr)
+				}
+
+				return nil, locErr
+			}
+		}
 
 		newMeta, newLoc, err = t.cat.CommitTable(retryCtx, t.identifier, reqs, updates)
 		if err == nil {
