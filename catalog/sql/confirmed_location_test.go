@@ -30,10 +30,17 @@ import (
 	"github.com/apache/iceberg-go/catalog"
 	sqlcat "github.com/apache/iceberg-go/catalog/sql"
 	"github.com/apache/iceberg-go/table"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/uptrace/bun/dialect"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/mssqldialect"
+	"github.com/uptrace/bun/dialect/mysqldialect"
+	"github.com/uptrace/bun/dialect/oracledialect"
+	"github.com/uptrace/bun/dialect/pgdialect"
+	"github.com/uptrace/bun/dialect/sqlitedialect"
 	"github.com/uptrace/bun/driver/sqliteshim"
+	"github.com/uptrace/bun/schema"
 )
 
 // confirmedRig is a sqlite catalog on a file database with a local warehouse,
@@ -180,12 +187,127 @@ func TestSqlCatalogAddsTheLocationColumnToAnOlderDatabase9633(t *testing.T) {
 	assert.True(t, ok)
 }
 
-func TestAddLocationColumnSQLPerDialect9633(t *testing.T) {
-	assert.Equal(t, "ALTER TABLE iceberg_tables ADD location NVARCHAR(2048) NULL", sqlcat.AddLocationColumnSQL(dialect.MSSQL))
-	assert.Equal(t, "ALTER TABLE iceberg_tables ADD location VARCHAR2(2048)", sqlcat.AddLocationColumnSQL(dialect.Oracle))
-	for _, d := range []dialect.Name{dialect.SQLite, dialect.PG, dialect.MySQL} {
-		assert.Equal(t, "ALTER TABLE iceberg_tables ADD COLUMN location VARCHAR(2048)", sqlcat.AddLocationColumnSQL(d), d.String())
+func TestAddLocationColumnQueryPerDialect9633(t *testing.T) {
+	// A sqlite connection formats for whichever dialect it is given; only the
+	// rendering is under test, nothing runs.
+	raw, err := sql.Open(sqliteshim.ShimName, ":memory:")
+	require.NoError(t, err)
+	defer raw.Close()
+	for _, c := range []struct {
+		d    schema.Dialect
+		want string
+	}{
+		{sqlitedialect.New(), `ALTER TABLE "iceberg_tables" ADD COLUMN "location" VARCHAR(2048)`},
+		{pgdialect.New(), `ALTER TABLE "iceberg_tables" ADD COLUMN "location" VARCHAR(2048)`},
+		{mysqldialect.New(), "ALTER TABLE `iceberg_tables` ADD COLUMN `location` VARCHAR(2048)"},
+		{mssqldialect.New(), `ALTER TABLE "iceberg_tables" ADD "location" NVARCHAR(2048) NULL`},
+		{oracledialect.New(), `ALTER TABLE "iceberg_tables" ADD "location" VARCHAR2(2048)`},
+	} {
+		db := bun.NewDB(raw, c.d)
+		assert.Equal(t, c.want, sqlcat.AddLocationColumnQuery(db).String(), c.d.Name().String())
 	}
+}
+
+// The recorded location outlives commits and renames, and a commit that would
+// move the table is refused at CommitTable, with or without the fork's check.
+func TestSqlCatalogKeepsTheRecordedLocationAcrossCommits9633(t *testing.T) {
+	ctx := context.Background()
+	r := newConfirmedRig(t)
+	cat := r.open(t)
+	require.NoError(t, cat.CreateNamespace(ctx, table.Identifier{"db"}, nil))
+	tbl, ident := createIn(t, cat, "t")
+	hot, _ := createIn(t, cat, "hot")
+
+	for i := range 2 {
+		tx := tbl.NewTransaction()
+		require.NoError(t, tx.SetProperties(iceberg.Properties{"round": string(rune('a' + i))}))
+		var err error
+		tbl, err = tx.Commit(ctx)
+		require.NoError(t, err)
+		loc, ok, err := cat.ConfirmedTableLocation(ctx, ident)
+		require.NoError(t, err)
+		require.True(t, ok, "commit %d dropped the recorded location", i+1)
+		assert.Equal(t, tbl.Location(), loc)
+	}
+
+	t.Run("set-location is refused at CommitTable", func(t *testing.T) {
+		_, _, err := cat.CommitTable(ctx, ident, nil, []table.Update{table.NewSetLocationUpdate(hot.Location())})
+		require.ErrorIs(t, err, table.ErrConfirmedLocationRefused)
+		again, err := cat.LoadTable(ctx, ident)
+		require.NoError(t, err)
+		assert.Equal(t, tbl.Location(), again.Location())
+		assert.Equal(t, tbl.MetadataLocation(), again.MetadataLocation(), "the head did not move")
+	})
+
+	t.Run("a rewritten base location is refused at CommitTable, no fork in the loop", func(t *testing.T) {
+		// A REST client's commit arrives at CommitTable with the catalog's own
+		// loaded base; a base whose location field was rewritten in place is
+		// refused by the catalog itself.
+		victim, vIdent := createIn(t, cat, "v")
+		plantFile(t, victim, hot.Location(), map[string]string{table.WriteMetadataPathKey: victim.Location() + "/metadata"})
+		_, _, err := cat.CommitTable(ctx, vIdent, nil, []table.Update{table.NewSetPropertiesUpdate(iceberg.Properties{"k": "v"})})
+		require.ErrorIs(t, err, table.ErrConfirmedLocationRefused)
+	})
+
+	t.Run("a rename keeps it", func(t *testing.T) {
+		renamed := table.Identifier{"db", "t_renamed"}
+		_, err := cat.RenameTable(ctx, ident, renamed)
+		require.NoError(t, err)
+		loc, ok, err := cat.ConfirmedTableLocation(ctx, renamed)
+		require.NoError(t, err)
+		assert.True(t, ok)
+		assert.Equal(t, tbl.Location(), loc)
+	})
+}
+
+// F6 from the #25 review: a create at, above or inside another table's
+// recorded location is refused; a sibling is not.
+func TestSqlCatalogRefusesACreateAtAboveOrInsideAnotherTable9633(t *testing.T) {
+	ctx := context.Background()
+	r := newConfirmedRig(t)
+	cat := r.open(t)
+	require.NoError(t, cat.CreateNamespace(ctx, table.Identifier{"db"}, nil))
+	existing, _ := createIn(t, cat, "t")
+	parent := existing.Location()[:strings.LastIndex(existing.Location(), "/")]
+
+	for name, loc := range map[string]string{
+		"the same location":       existing.Location(),
+		"above it, the namespace": parent,
+		"inside it":               existing.Location() + "/data",
+		"the bare local spelling": strings.TrimPrefix(existing.Location(), "file://"),
+		"a trailing slash":        existing.Location() + "/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := cat.CreateTable(ctx, table.Identifier{"db", "x_" + strings.ReplaceAll(name, " ", "_")}, tableSchemaNested, catalog.WithLocation(loc))
+			require.ErrorIs(t, err, catalog.ErrTableAlreadyExists, loc)
+		})
+	}
+	t.Run("a sibling with a shared prefix is fine", func(t *testing.T) {
+		_, err := cat.CreateTable(ctx, table.Identifier{"db", "t2"}, tableSchemaNested, catalog.WithLocation(existing.Location()+"2"))
+		require.NoError(t, err)
+	})
+	t.Run("create by commit is held the same way", func(t *testing.T) {
+		createByCommit := func(name, loc string) error {
+			_, _, err := cat.CommitTable(ctx, table.Identifier{"db", name},
+				[]table.Requirement{table.AssertCreate()},
+				[]table.Update{
+					table.NewAssignUUIDUpdate(uuid.New()),
+					table.NewUpgradeFormatVersionUpdate(2),
+					table.NewAddSchemaUpdate(tableSchemaNested),
+					table.NewSetCurrentSchemaUpdate(-1),
+					table.NewSetLocationUpdate(loc),
+				})
+
+			return err
+		}
+		require.ErrorIs(t, createByCommit("c_above", parent), catalog.ErrTableAlreadyExists)
+		require.ErrorIs(t, createByCommit("c_inside", existing.Location()+"/metadata"), catalog.ErrTableAlreadyExists)
+		require.NoError(t, createByCommit("c_free", parent+"/c_free"))
+		loc, ok, err := cat.ConfirmedTableLocation(ctx, table.Identifier{"db", "c_free"})
+		require.NoError(t, err)
+		assert.True(t, ok)
+		assert.Equal(t, parent+"/c_free", loc)
+	})
 }
 
 // The two plants the write anchor cannot see, through the sqlite catalog as

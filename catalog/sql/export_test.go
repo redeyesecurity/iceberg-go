@@ -40,5 +40,5 @@ func SetCreateCheckedHook(fn func(context.Context)) (restore func()) {
 	return func() { testhooks.CreateChecked = nil }
 }
 
-// AddLocationColumnSQL exposes the dialect ALTER for the location column.
-var AddLocationColumnSQL = addLocationColumnSQL
+// AddLocationColumnQuery exposes the dialect ALTER for the location column.
+var AddLocationColumnQuery = addLocationColumnQuery
