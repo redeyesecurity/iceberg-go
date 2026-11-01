@@ -458,6 +458,7 @@ type ParquetFileWriter struct {
 	info       WriteFileInfo
 	partition  map[int]any
 	colMapping map[string]int
+	observer   FileObserver
 }
 
 // NewFileWriter creates a ParquetFileWriter that writes batches to a single
@@ -498,11 +499,16 @@ func (p parquetFormat) NewFileWriter(ctx context.Context, fs iceio.WriteFileIO,
 		info:       info,
 		partition:  partitionValues,
 		colMapping: colMapping,
+		observer:   fileObserverFromContext(ctx, info.FileName, info.Content, arrowSchema),
 	}, nil
 }
 
 // Write appends a record batch to the Parquet file.
 func (w *ParquetFileWriter) Write(batch arrow.RecordBatch) error {
+	if w.observer != nil {
+		w.observer.Observe(batch)
+	}
+
 	return w.pqWriter.WriteBuffered(batch)
 }
 
@@ -515,6 +521,14 @@ func (w *ParquetFileWriter) BytesWritten() int64 {
 // accurate file statistics and size.
 func (w *ParquetFileWriter) Close() (_ iceberg.DataFile, err error) {
 	defer internal.CheckedClose(w.fileCloser, &err)
+
+	if w.observer != nil {
+		for _, kv := range sortedKeyValues(w.observer.KeyValues()) {
+			if err = w.pqWriter.AppendKeyValueMetadata(kv[0], kv[1]); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	if err = w.pqWriter.Close(); err != nil {
 		return nil, err
