@@ -23,11 +23,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"strings"
 
 	icebergio "github.com/apache/iceberg-go/io"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"gocloud.dev/blob"
 	"gocloud.dev/gcerrors"
 )
@@ -228,8 +231,10 @@ func (bfs *blobFileIO) DeleteFiles(ctx context.Context, paths []string) ([]strin
 		}
 
 		if err := bfs.Delete(ctx, key); err != nil {
-			// Missing files are not errors per the interface contract.
-			if gcerrors.Code(err) == gcerrors.NotFound {
+			// Missing files are not errors per the interface contract. Only a
+			// real absence counts: see isAbsent for why gcerrors.NotFound alone
+			// is not enough on s3blob (caver-go#11489).
+			if isAbsent(err) {
 				deleted = append(deleted, p)
 
 				continue
@@ -244,6 +249,52 @@ func (bfs *blobFileIO) DeleteFiles(ctx context.Context, paths []string) ([]strin
 	}
 
 	return deleted, errs
+}
+
+// isAbsent reports whether err from a blob delete means the object is genuinely
+// not there, so a delete of it is already done.
+//
+// gocloud's s3blob maps any smithy.OperationError whose text contains "301" to
+// NoSuchBucket and so to gcerrors.NotFound. That matches a wrong-region redirect,
+// and a 403 or 5xx whose request id happens to hold "301". Trusting the normalised
+// code would report such a delete as done while the bytes stay (caver-go#11489,
+// #9249). When the error carries the S3 SDK's types we therefore decide from what
+// the server said: code NoSuchKey, or HTTP 404 with a code other than
+// NoSuchBucket (a missing bucket is not a missing file). For every other driver
+// (fileblob, memblob, gcsblob, azureblob) gocloud's NotFound is correct.
+func isAbsent(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var (
+		ae smithy.APIError
+		re *smithyhttp.ResponseError
+		oe *smithy.OperationError
+	)
+
+	hasAPI := errors.As(err, &ae)
+	hasResp := errors.As(err, &re)
+	hasOp := errors.As(err, &oe)
+
+	if !hasAPI && !hasResp && !hasOp {
+		return gcerrors.Code(err) == gcerrors.NotFound
+	}
+
+	var code string
+	if hasAPI {
+		code = ae.ErrorCode()
+	}
+
+	if code == "NoSuchBucket" {
+		return false
+	}
+
+	if code == "NoSuchKey" {
+		return true
+	}
+
+	return hasResp && re.HTTPStatusCode() == http.StatusNotFound
 }
 
 type blobWriteFile struct {

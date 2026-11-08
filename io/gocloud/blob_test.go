@@ -21,13 +21,20 @@ import (
 	"context"
 	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	icebergio "github.com/apache/iceberg-go/io"
 	"gocloud.dev/blob/memblob"
+	"gocloud.dev/blob/s3blob"
 )
 
 func TestDefaultKeyExtractor(t *testing.T) {
@@ -378,4 +385,79 @@ func TestBlobFileIODeleteFilesEmpty(t *testing.T) {
 	deleted, err := bulk.DeleteFiles(ctx, nil)
 	require.NoError(t, err)
 	assert.Nil(t, deleted)
+}
+
+// newFakeS3FileIO returns a blobFileIO over a real s3blob bucket whose endpoint is
+// an httptest server that answers every request with the given status and body.
+// Retries are off so a 500 is observed as the error, not as a retried success.
+func newFakeS3FileIO(t *testing.T, status int, body string) icebergio.BulkRemovableIO {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.Header().Set("x-amz-request-id", "REQ301ABC")
+		w.WriteHeader(status)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write([]byte(body))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := aws.Config{
+		Region:           "us-east-1",
+		Credentials:      credentials.NewStaticCredentialsProvider("k", "s", ""),
+		RetryMaxAttempts: 1,
+	}
+	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(srv.URL)
+		o.UsePathStyle = true
+	})
+
+	bucket, err := s3blob.OpenBucketV2(context.Background(), client, "test-bucket", nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = bucket.Close() })
+
+	return createBlobFS(context.Background(), bucket, defaultKeyExtractor("test-bucket")).(icebergio.BulkRemovableIO)
+}
+
+// TestBlobFileIODeleteFilesS3Errors pins caver-go#11489: only a real absence (404 or
+// NoSuchKey) counts as already deleted. A 301 wrong-region redirect, a 403 and a 500
+// (all with a request id that holds "301") must come back as errors with nothing
+// reported deleted.
+func TestBlobFileIODeleteFilesS3Errors(t *testing.T) {
+	const path = "s3://test-bucket/data/f.parquet"
+
+	xmlErr := func(code string) string {
+		return `<?xml version="1.0" encoding="UTF-8"?><Error><Code>` + code +
+			`</Code><Message>m</Message><RequestId>REQ301ABC</RequestId></Error>`
+	}
+
+	cases := []struct {
+		name        string
+		status      int
+		body        string
+		wantDeleted bool
+	}{
+		{"301 wrong region", http.StatusMovedPermanently, xmlErr("PermanentRedirect"), false},
+		{"403 access denied", http.StatusForbidden, xmlErr("AccessDenied"), false},
+		{"500 internal error", http.StatusInternalServerError, xmlErr("InternalError"), false},
+		{"404 no such key", http.StatusNotFound, xmlErr("NoSuchKey"), true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bulk := newFakeS3FileIO(t, tc.status, tc.body)
+
+			deleted, err := bulk.DeleteFiles(context.Background(), []string{path})
+			if tc.wantDeleted {
+				require.NoError(t, err)
+				assert.Equal(t, []string{path}, deleted)
+
+				return
+			}
+
+			require.Error(t, err)
+			assert.Empty(t, deleted)
+		})
+	}
 }
