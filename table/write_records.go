@@ -39,6 +39,27 @@ type writeRecordConfig struct {
 	writeUUID       *uuid.UUID
 	maxWriteWorkers int
 	clustered       bool
+	recordSchema    bool
+}
+
+// WithRecordFileSchema makes each data file declare only the columns the provided
+// Arrow schema has, in place of every column of the table's current schema.
+//
+// Without it a column the records do not carry is written anyway, as nulls, and
+// the file's footer names it: on a wide table whose batches each use a few
+// columns, most of a small file is footer for columns that say nothing
+// (caver-go#8012). With it the file schema is the table schema pruned to the
+// provided fields, keeping the table's field ids, names and types, so a reader
+// that resolves columns by field id reads an omitted column as null, which is
+// what the Iceberg spec says about a file written before a column was added.
+//
+// The provided schema must still be compatible with the table schema: a required
+// table column cannot be left out, and neither can the source column of a
+// partition field.
+func WithRecordFileSchema() WriteRecordOption {
+	return func(c *writeRecordConfig) {
+		c.recordSchema = true
+	}
 }
 
 // WithTargetFileSize overrides the table's default target file size.
@@ -172,6 +193,7 @@ func WriteRecords(ctx context.Context, tbl *Table,
 		writeUUID:       cfg.writeUUID,
 		maxWriteWorkers: cfg.maxWriteWorkers,
 		clustered:       cfg.clustered,
+		recordSchema:    cfg.recordSchema,
 	}
 
 	return recordsToDataFiles(ctx, tbl.Location(), meta, args)

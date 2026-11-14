@@ -283,3 +283,53 @@ The lineage suite is `go test ./ ./io/... ./table/... ./catalog/...` AND
 `table/` records both results in its PR. `-race ./table/...` needs the
 `PartitionField.EscapedName` fix from fork PR #31 as well: with only one of
 the two on the branch, `./table` still reds under `-race`.
+
+## 6. `WriteRecords` can write a file with only the record's columns: `table.WithRecordFileSchema()`
+
+`WriteRecords` documents that the Arrow schema may be a subset of the table
+schema, but the writer still set the file schema to the table's current schema
+and ran every batch through `ToRequestedSchema`, which pads each missing field
+back in as nulls. So a data file always declared every column of the table.
+
+On a wide table whose batches each use a few columns that is most of a small
+file. Measured on the caver-go EHR benchmark (caver-go#8012, 2,000,000 events,
+1,060 files): footers are 45 percent of the data files at about 283 bytes per
+leaf column per file, and 154 of the 180 leaves a file declares hold only
+nulls in that file.
+
+### The patch
+
+- `table/write_records.go`: `WithRecordFileSchema()`, a `WriteRecordOption`.
+- `table/arrow_utils.go`: with the option, `recordsToDataFiles` hands the
+  writer factory `recordFileSchema(table schema, task schema, spec)` through the
+  existing `withFactoryFileSchema`. That is the table schema pruned
+  (`iceberg.PruneColumns`) to the leaf fields the provided schema has, so the
+  file keeps the table's field ids, names and types and the batch is still
+  promoted to the table's types. Column names are sanitized as before.
+
+Default behavior is unchanged: without the option the file schema is the
+table's current schema.
+
+Refused, with `iceberg.ErrInvalidSchema`: a provided schema that leaves out the
+source column of a partition field. A missing required column is refused as
+before by `checkArrowSchemaCompat`.
+
+Readers: a file that lacks a column is what a file written before the column
+was added looks like, so a reader that resolves by field id returns null for
+it. The test reads the narrow file back through `ToRequestedSchema` against the
+full table schema and checks the omitted columns are null and the written
+values are unchanged.
+
+### What this does NOT do
+
+It does not decide which columns to leave out. The caller prunes the record
+(caver-go drops the leaves that are entirely null in the batch) and passes the
+narrower schema. Rewrites that go through other entry points (compaction, the
+roll) still write the table's full schema.
+
+### Testing
+
+`table/write_records_file_schema_test.go`: the file declares only the record's
+leaves with the table's field ids and types; the omitted columns read back as
+null; a partition source column cannot be omitted; a required column still
+cannot be omitted.

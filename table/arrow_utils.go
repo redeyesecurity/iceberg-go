@@ -1499,6 +1499,48 @@ type recordWritingArgs struct {
 	counter         iter.Seq[int]
 	maxWriteWorkers int
 	clustered       bool
+	// recordSchema writes each data file with the provided schema's columns only
+	// (WithRecordFileSchema), not every column of the table's current schema.
+	recordSchema bool
+}
+
+// recordFileSchema is the table schema pruned to the leaf fields the task schema
+// has: the table's ids, names and types for exactly the columns the records carry.
+// Parents of a kept leaf are kept. It refuses a result that leaves out the source
+// column of a partition field, which the partitioned writers read from the file
+// schema's record.
+func recordFileSchema(tableSchema, taskSchema *iceberg.Schema, spec *iceberg.PartitionSpec) (*iceberg.Schema, error) {
+	byID, err := iceberg.IndexByID(taskSchema)
+	if err != nil {
+		return nil, err
+	}
+	selected := make(map[int]iceberg.Void, len(byID))
+	for id, f := range byID {
+		if _, nested := f.Type.(iceberg.NestedType); !nested {
+			selected[id] = iceberg.Void{}
+		}
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("%w: the provided schema has no columns to write", iceberg.ErrInvalidSchema)
+	}
+	pruned, err := iceberg.PruneColumns(tableSchema, selected, false)
+	if err != nil {
+		return nil, err
+	}
+	if spec != nil {
+		for _, f := range spec.Fields() {
+			for _, src := range f.SourceIDs {
+				if _, ok := pruned.FindFieldByID(src); !ok {
+					name, _ := tableSchema.FindColumnName(src)
+
+					return nil, fmt.Errorf("%w: partition field %q needs column %q (id %d), which the provided schema leaves out",
+						iceberg.ErrInvalidSchema, f.Name, name, src)
+				}
+			}
+		}
+	}
+
+	return pruned, nil
 }
 
 func recordsToDataFiles(ctx context.Context, rootLocation string, meta *MetadataBuilder, args recordWritingArgs) (ret iter.Seq2[iceberg.DataFile, error]) {
@@ -1537,7 +1579,22 @@ func recordsToDataFiles(ctx context.Context, rootLocation string, meta *Metadata
 		}
 	}
 
-	factory, err := newWriterFactory(rootLocation, args, meta, taskSchema, targetFileSize)
+	var factoryOpts []writerFactoryOption
+	if args.recordSchema {
+		spec, _ := meta.CurrentSpec()
+		fileSchema, err := recordFileSchema(meta.CurrentSchema(), taskSchema, spec)
+		if err == nil {
+			fileSchema, err = iceberg.SanitizeColumnNames(fileSchema)
+		}
+		if err != nil {
+			return func(yield func(iceberg.DataFile, error) bool) {
+				yield(nil, err)
+			}
+		}
+		factoryOpts = append(factoryOpts, withFactoryFileSchema(fileSchema))
+	}
+
+	factory, err := newWriterFactory(rootLocation, args, meta, taskSchema, targetFileSize, factoryOpts...)
 	if err != nil {
 		panic(err)
 	}
