@@ -333,3 +333,52 @@ roll) still write the table's full schema.
 leaves with the table's field ids and types; the omitted columns read back as
 null; a partition source column cannot be omitted; a required column still
 cannot be omitted.
+
+## 7. A struct leaf named in a per-column metrics property keeps its bounds
+
+caver-go#12139.
+
+### The problem
+
+The stats plan downgrades every nested column from `full` or `truncate(N)` to
+`counts` (`arrowStatsCollector.Primitive`: any column whose name holds a dot).
+So a manifest entry never carries a lower or an upper bound for a struct leaf,
+whatever the table asks for, and a filter on one cannot skip a file at plan
+time. Every file in the window is opened for its footer.
+
+Measured on a caver-go box, 2026-11-18: the same 123 rows over 7 days took
+0.3 s read from the one index that holds them and 10.1 s warm (62.6 s cold)
+read through a class table with a filter on `ocsf.class_uid`, a struct leaf.
+
+### The change
+
+A nested column keeps bounds when both are true:
+
+1. the table names it: `write.metadata.metrics.column.<dotted name>` is set to
+   `full` or `truncate(N)`;
+2. every ancestor is a struct. No list and no map above it.
+
+A struct leaf holds one value a row, so the file's min and max bound every row.
+A column under a list or a map holds several, and stays at `counts` even when a
+property names it.
+
+The default mode (`write.metadata.metrics.default`) still never gives a nested
+column bounds. A wide struct would otherwise put two bounds a leaf into every
+manifest entry, which is the bloat the downgrade exists to prevent.
+
+### What this does NOT do
+
+- It changes nothing for a table that names no nested column. Output is
+  identical.
+- It writes bounds for new files only. A file registered before it has none
+  and is planned, as before.
+- It does not touch the evaluators. `inclusiveMetricsEval` already works by
+  field id and treats a missing bound as "might match".
+
+### Testing
+
+`table/arrow_utils_internal_test.go`, in `FileStatsMetricsSuite`: a named
+struct leaf carries bounds 1 and 54 for rows 1, null, (null struct), 54; the
+default mode `full` gives no nested column bounds; a named list element, map
+key and map value carry counts and no bounds. Six changes to the rule each
+fail a test.
