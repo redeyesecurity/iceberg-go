@@ -1282,6 +1282,9 @@ type arrowStatsCollector struct {
 	schema      *iceberg.Schema
 	props       iceberg.Properties
 	defaultMode string
+	// repeated counts the list and map levels above the field being visited. A column
+	// under one holds several values a row, so a file's min and max do not bound a row.
+	repeated int
 }
 
 func (a *arrowStatsCollector) Schema(_ *iceberg.Schema, results func() []tblutils.StatisticsCollector) []tblutils.StatisticsCollector {
@@ -1305,11 +1308,16 @@ func (a *arrowStatsCollector) Field(field iceberg.NestedField, fieldRes func() [
 
 func (a *arrowStatsCollector) List(list iceberg.ListType, elemResult func() []tblutils.StatisticsCollector) []tblutils.StatisticsCollector {
 	a.fieldID = list.ElementID
+	a.repeated++
+	defer func() { a.repeated-- }()
 
 	return elemResult()
 }
 
 func (a *arrowStatsCollector) Map(m iceberg.MapType, keyResult, valResult func() []tblutils.StatisticsCollector) []tblutils.StatisticsCollector {
+	a.repeated++
+	defer func() { a.repeated-- }()
+
 	a.fieldID = m.KeyID
 	keyRes := keyResult()
 
@@ -1330,8 +1338,8 @@ func (a *arrowStatsCollector) Primitive(dt iceberg.PrimitiveType) []tblutils.Sta
 		panic(err)
 	}
 
-	colMode, ok := a.props[MetricsModeColumnConfPrefix+"."+colName]
-	if ok {
+	colMode, named := a.props[MetricsModeColumnConfPrefix+"."+colName]
+	if named {
 		metMode, err = tblutils.MatchMetricsMode(colMode)
 		if err != nil {
 			panic(err)
@@ -1347,8 +1355,16 @@ func (a *arrowStatsCollector) Primitive(dt iceberg.PrimitiveType) []tblutils.Sta
 		}
 	}
 
+	// A nested column keeps counts and no bounds, with one exception (caver-go#12139): a
+	// column the table NAMES in a per-column property, whose ancestors are all structs.
+	// Such a leaf has one value a row, so its file min and max bound every row and the
+	// planner can skip a file on them; without bounds a filter on it opens every file.
+	// The default mode still never gives a nested column bounds: a wide struct would put
+	// two bounds a leaf in every manifest entry. A column under a list or a map never
+	// gets them, named or not.
 	isNested := strings.Contains(colName, ".")
-	if isNested && (metMode.Typ == tblutils.MetricModeTruncate || metMode.Typ == tblutils.MetricModeFull) {
+	structLeafNamed := named && a.repeated == 0
+	if isNested && !structLeafNamed && (metMode.Typ == tblutils.MetricModeTruncate || metMode.Typ == tblutils.MetricModeFull) {
 		metMode = tblutils.MetricsMode{Typ: tblutils.MetricModeCounts}
 	}
 

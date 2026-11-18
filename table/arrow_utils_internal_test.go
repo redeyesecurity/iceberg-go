@@ -348,6 +348,59 @@ func (suite *FileStatsMetricsSuite) TestColumnMetricsMode() {
 	suite.Equal(float32(100), ub.(iceberg.Float32Literal).Value())
 }
 
+// A struct leaf the table names in a per-column property keeps its bounds
+// (caver-go#12139): one value a row, so the file's min and max bound every row.
+func (suite *FileStatsMetricsSuite) TestNamedStructLeafKeepsBounds() {
+	df := suite.getDataFile(iceberg.Properties{
+		"write.metadata.metrics.default":          "none",
+		"write.metadata.metrics.column.structs.x": "full",
+	}, nil)
+
+	// structs.x is field 9, with rows 1, null, (struct null), 54.
+	suite.Equal(map[int]int64{9: 4}, df.ValueCounts())
+	suite.Equal(map[int]int64{9: 2}, df.NullValueCounts())
+	suite.Len(df.LowerBoundValues(), 1)
+	suite.Len(df.UpperBoundValues(), 1)
+	lb, err := iceberg.LiteralFromBytes(iceberg.PrimitiveTypes.Int64, df.LowerBoundValues()[9])
+	suite.Require().NoError(err)
+	suite.Equal(int64(1), lb.(iceberg.Int64Literal).Value())
+	ub, err := iceberg.LiteralFromBytes(iceberg.PrimitiveTypes.Int64, df.UpperBoundValues()[9])
+	suite.Require().NoError(err)
+	suite.Equal(int64(54), ub.(iceberg.Int64Literal).Value())
+}
+
+// The default mode never gives a nested column bounds, struct leaf or not: only a
+// column named in a property gets them.
+func (suite *FileStatsMetricsSuite) TestUnnamedStructLeafKeepsCountsOnly() {
+	df := suite.getDataFile(iceberg.Properties{"write.metadata.metrics.default": "full"}, nil)
+	suite.Len(df.LowerBoundValues(), 2)
+	suite.Len(df.UpperBoundValues(), 2)
+	for _, id := range []int{6, 7, 8, 9, 10} {
+		suite.NotContains(df.LowerBoundValues(), id)
+		suite.NotContains(df.UpperBoundValues(), id)
+	}
+	suite.Contains(df.ValueCounts(), 9)
+}
+
+// A column under a list or a map never gets bounds, even when a property names it: it
+// holds several values a row.
+func (suite *FileStatsMetricsSuite) TestNamedRepeatedColumnKeepsCountsOnly() {
+	df := suite.getDataFile(iceberg.Properties{
+		"write.metadata.metrics.default":              "none",
+		"write.metadata.metrics.column.list.element":  "full",
+		"write.metadata.metrics.column.maps.key":      "full",
+		"write.metadata.metrics.column.maps.value":    "truncate(4)",
+		"write.metadata.metrics.column.structs.y":     "counts",
+		"write.metadata.metrics.column.no.such.field": "full",
+	}, nil)
+	suite.Len(df.LowerBoundValues(), 0)
+	suite.Len(df.UpperBoundValues(), 0)
+	for _, id := range []int{6, 7, 8, 10} {
+		suite.Contains(df.ValueCounts(), id)
+	}
+	suite.Len(df.ValueCounts(), 4)
+}
+
 func (suite *FileStatsMetricsSuite) TestReadMissingStats() {
 	df := suite.getDataFile(nil, []string{"strings"})
 
